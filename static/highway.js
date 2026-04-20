@@ -985,6 +985,32 @@ function createHighway() {
                             document.getElementById('hud-artist').textContent = msg.artist;
                             document.getElementById('hud-title').textContent = msg.title;
                             document.getElementById('hud-arrangement').textContent = msg.arrangement;
+
+                            // Clear any lingering audio-error banner from a prior song.
+                            const existingAudioErr = document.getElementById('audio-error-banner');
+                            if (existingAudioErr) existingAudioErr.remove();
+
+                            // Server reported a concrete audio-pipeline failure and has
+                            // no URL to give us — surface it instead of leaving the
+                            // user with a cryptic "Empty src attribute" from audio.play().
+                            if (!msg.audio_url && msg.audio_error) {
+                                const banner = document.createElement('div');
+                                banner.id = 'audio-error-banner';
+                                banner.className = 'fixed top-4 left-1/2 -translate-x-1/2 z-[300] bg-red-900/95 border border-red-700 text-red-100 rounded-lg px-4 py-3 max-w-2xl shadow-xl';
+                                banner.innerHTML = `
+                                    <div class="flex items-start gap-3">
+                                        <span class="text-xl leading-none">⚠</span>
+                                        <div class="flex-1">
+                                            <div class="font-semibold text-sm">Audio unavailable</div>
+                                            <div class="text-xs text-red-200 mt-1"></div>
+                                        </div>
+                                        <button class="text-red-300 hover:text-white text-lg leading-none" aria-label="Dismiss">✕</button>
+                                    </div>`;
+                                banner.querySelector('.text-xs').textContent = msg.audio_error;
+                                banner.querySelector('button').addEventListener('click', () => banner.remove());
+                                document.body.appendChild(banner);
+                            }
+
                             if (msg.audio_url) {
                                 const audio = document.getElementById('audio');
                                 if (!audio.src || !audio.src.includes(msg.audio_url.split('/').pop())) {
