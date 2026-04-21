@@ -229,6 +229,7 @@ Routes are registered under `/api/plugins/{plugin_id}/` to avoid conflicts.
 | [Lyrics Sync](https://github.com/byrongamatos/slopsmith-plugin-lyrics-sync) | Generate synced LRC lyrics from text + vocals stem via Whisper alignment | `git clone ...slopsmith-plugin-lyrics-sync.git lyrics_sync` |
 | [NAM Tone Engine](https://github.com/byrongamatos/slopsmith-plugin-nam-tone) | In-browser amp modeling with NAM WASM, cabinet IRs, tone auto-switching | `git clone ...slopsmith-plugin-nam-tone.git nam_tone` |
 | [Guitar Theory Lab](https://github.com/topkoa/slopsmith-plugin-guitar-theory) | Explore scales, chords, intervals, tunings, and voicings on a fully interactive fretboard  | `git clone ...slopsmith-plugin-nam-tone.git guitar-theory-lab` |
+| [Themes](https://github.com/masc0t/slopsmith-plugin-themes) | Offers several basic recolorings of the interface  | `git clone ...slopsmith-plugin-themes.git themes` |
 
 Install any plugin by cloning it into your `plugins/` directory and restarting:
 
