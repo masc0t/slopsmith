@@ -85,9 +85,14 @@ verify_sha256() {
   local actual
   actual=$(sha256sum "$file" | awk '{print $1}')
   if [[ "$actual" != "$expected" ]]; then
+    if [[ "${SKIP_HASH_CHECK:-0}" == "1" ]]; then
+      warn "SHA256 mismatch for ${label} (expected ${expected}, got ${actual}) — continuing because SKIP_HASH_CHECK=1."
+      return 0
+    fi
     die "SHA256 mismatch for ${label}:\n" \
         "       expected: ${expected}\n" \
-        "       got:      ${actual}"
+        "       got:      ${actual}\n" \
+        "       Refresh the pinned hash, or set SKIP_HASH_CHECK=1 to bypass."
   fi
   ok "SHA256 verified for ${label}."
 }
