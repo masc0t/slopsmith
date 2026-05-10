@@ -346,6 +346,11 @@ for d in lib static plugins; do
     cp -r "${d}/." "${ROOTFS}${APP_DIR}/${d}/"
     info "  Copied ${d}/"
   else
+    # main.py imports logging_setup from lib/; server.py imports plugins.
+    # Without these the rootfs boots and the service crashes immediately.
+    if [[ "$d" == "lib" || "$d" == "plugins" ]]; then
+      die "  '${d}/' not found — required for the service to import."
+    fi
     warn "  Local '${d}/' not found – skipping."
   fi
 done
@@ -449,11 +454,16 @@ ok "Service enabled."
 # =============================================================================
 info "Applying Proxmox CT compatibility tweaks …"
 
-# (a) Ensure a working /etc/hostname and /etc/hosts
-echo "slopsmith" > "${ROOTFS}/etc/hostname"
+# (a) Ensure a working /etc/hostname and /etc/hosts.
+# Use OUTPUT_NAME (already validated to a safe filename charset) so the
+# template's identity matches the artifact name. This is just a sane
+# fallback — `pct restore --hostname …` (or the Proxmox UI) will overwrite
+# /etc/hostname when the CT is created from this template.
+DEFAULT_HOSTNAME="${OUTPUT_NAME//_/-}"  # underscores aren't valid in hostnames
+echo "${DEFAULT_HOSTNAME}" > "${ROOTFS}/etc/hostname"
 cat > "${ROOTFS}/etc/hosts" <<EOF
 127.0.0.1   localhost
-127.0.1.1   slopsmith
+127.0.1.1   ${DEFAULT_HOSTNAME}
 ::1         localhost ip6-localhost ip6-loopback
 EOF
 
