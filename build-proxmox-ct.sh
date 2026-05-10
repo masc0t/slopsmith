@@ -114,7 +114,8 @@ cleanup() {
   local rc=$?
   if [[ $rc -ne 0 && -d "${BUILD_BASE:-}" ]]; then
     warn "Build failed (exit $rc). Partial rootfs left at ${BUILD_BASE} for inspection."
-    warn "Run 'sudo rm -rf ${BUILD_BASE}' to clean up."
+    # printf %q so copy/paste works even if BUILD_BASE contains spaces or shell metas
+    warn "Run: sudo rm -rf $(printf '%q' "${BUILD_BASE}")"
   elif [[ $rc -eq 0 && -d "${BUILD_BASE:-}" && "${KEEP_BUILD_DIR:-0}" != "1" ]]; then
     info "Removing build directory ${BUILD_BASE} (set KEEP_BUILD_DIR=1 to retain)."
     rm -rf "${BUILD_BASE}"
@@ -186,8 +187,9 @@ done
 
 # =============================================================================
 # Helper: run a command inside the rootfs via systemd-nspawn
-# --pipe keeps stdin/stdout connected; 
-# Or --quiet suppresses nspawn chatter.
+# --quiet suppresses nspawn chatter so apt/dotnet output is the only
+# thing we see during the build. The host's /etc/resolv.conf is
+# bind-mounted read-only so DNS works inside nspawn.
 # =============================================================================
 r() {
   systemd-nspawn \
