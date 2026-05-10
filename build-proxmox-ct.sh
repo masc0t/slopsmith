@@ -18,6 +18,7 @@
 #                       to override mismatches when an upstream artifact rolls
 #                       (e.g. dot.net/v1/dotnet-install.sh). Use with caution.
 #   KEEP_BUILD_DIR=1    Retain ${BUILD_BASE} after a successful build
+#   FORCE_REBUILD=1     Delete an existing rootfs without prompting (for CI)
 #
 # Prerequisites (install in WSL):
 #   sudo apt install debootstrap systemd-container tar zstd curl unzip git
@@ -111,13 +112,26 @@ case "$TARGETARCH" in
   *)     die "Unsupported TARGETARCH: ${TARGETARCH}. Expected: amd64 | arm64" ;;
 esac
 
-# arm64 cross-builds require qemu-user-static + binfmt registration
+# arm64 cross-builds require qemu-user-static + a registered binfmt handler.
+# Checking the binary alone isn't enough — without a registered+enabled handler
+# debootstrap/nspawn fail later with "exec format error" after significant
+# wasted setup time.
 if [[ "$TARGETARCH" == "arm64" && "$(uname -m)" != "aarch64" ]]; then
-  if ! command -v qemu-aarch64-static &>/dev/null || \
-     ! [[ -d /proc/sys/fs/binfmt_misc ]]; then
-    die "arm64 builds on a non-arm64 host require qemu-user-static and binfmt_misc.\n" \
+  if ! command -v qemu-aarch64-static &>/dev/null; then
+    die "arm64 builds on a non-arm64 host require qemu-user-static.\n" \
         "       Install with: sudo apt install qemu-user-static binfmt-support\n" \
         "       Then re-run this script."
+  fi
+  binfmt_reg=""
+  for f in /proc/sys/fs/binfmt_misc/qemu-aarch64 \
+           /proc/sys/fs/binfmt_misc/qemu-aarch64-static; do
+    [[ -f "$f" ]] && grep -q '^enabled' "$f" 2>/dev/null && { binfmt_reg="$f"; break; }
+  done
+  if [[ -z "$binfmt_reg" ]]; then
+    die "arm64 binfmt handler not registered or not enabled.\n" \
+        "       Register with: sudo apt install qemu-user-static binfmt-support\n" \
+        "       Or:           docker run --rm --privileged multiarch/qemu-user-static --reset -p yes\n" \
+        "       Then verify:  grep ^enabled /proc/sys/fs/binfmt_misc/qemu-aarch64*"
   fi
 fi
 
@@ -144,12 +158,19 @@ r() {
 # =============================================================================
 info "Bootstrapping Debian Trixie (${DEBIAN_ARCH}) rootfs at ${ROOTFS} …"
 if [[ -d "$ROOTFS" ]]; then
-  warn "Existing rootfs found at ${ROOTFS} – remove it to rebuild from scratch."
-  read -rp "    Delete and rebuild? [y/N] " yn
-  if [[ "$yn" =~ ^[Yy]$ ]]; then
+  if [[ "${FORCE_REBUILD:-0}" == "1" ]]; then
+    info "FORCE_REBUILD=1 — removing existing rootfs at ${ROOTFS}."
     rm -rf "$ROOTFS" || die "Failed to remove existing rootfs at ${ROOTFS}."
+  elif [[ -t 0 ]]; then
+    warn "Existing rootfs found at ${ROOTFS} – remove it to rebuild from scratch."
+    read -rp "    Delete and rebuild? [y/N] " yn
+    if [[ "$yn" =~ ^[Yy]$ ]]; then
+      rm -rf "$ROOTFS" || die "Failed to remove existing rootfs at ${ROOTFS}."
+    else
+      die "Aborting."
+    fi
   else
-    die "Aborting."
+    die "Existing rootfs at ${ROOTFS}; rerun with FORCE_REBUILD=1 to overwrite."
   fi
 fi
 
