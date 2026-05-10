@@ -43,9 +43,10 @@ if [[ ! "$OUTPUT_NAME" =~ ^[A-Za-z0-9._-]+$ ]]; then
   exit 1
 fi
 
-# debootstrap requires a real Linux filesystem (ext4/tmpfs) – it creates
+# debootstrap requires a real Linux filesystem (ext4/tmpfs/etc.) — it creates
 # device nodes that NTFS/FUSE mounts (/mnt/c, /mnt/d …) cannot represent.
-# We build everything under /tmp (tmpfs) and copy the final tarball back.
+# We default the build dir to /tmp (a Linux fs on every WSL2 setup we've
+# seen, even when /tmp isn't strictly tmpfs) and copy the final tarball back.
 PROJECT_DIR="$(pwd)"          # may be on /mnt/d – that's fine for source files
 # Namespace BUILD_BASE by OUTPUT_NAME + TARGETARCH so concurrent invocations
 # (or stale leftovers from a prior build of a different artifact) don't
@@ -114,8 +115,10 @@ cleanup() {
   local rc=$?
   if [[ $rc -ne 0 && -d "${BUILD_BASE:-}" ]]; then
     warn "Build failed (exit $rc). Partial rootfs left at ${BUILD_BASE} for inspection."
-    # printf %q so copy/paste works even if BUILD_BASE contains spaces or shell metas
-    warn "Run: sudo rm -rf $(printf '%q' "${BUILD_BASE}")"
+    # Use printf directly: warn() pipes through `echo -e`, which would
+    # re-interpret the backslash escapes that `printf %q` emits and
+    # silently break the suggested cleanup command.
+    printf "\033[1;33m[WARN]\033[0m  Run: sudo rm -rf %q\n" "${BUILD_BASE}"
   elif [[ $rc -eq 0 && -d "${BUILD_BASE:-}" && "${KEEP_BUILD_DIR:-0}" != "1" ]]; then
     info "Removing build directory ${BUILD_BASE} (set KEEP_BUILD_DIR=1 to retain)."
     rm -rf "${BUILD_BASE}"
