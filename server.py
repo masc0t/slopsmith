@@ -325,11 +325,13 @@ class MetadataDB:
         return {r[0] for r in self.conn.execute("SELECT filename FROM favorites").fetchall()}
 
     def get(self, filename: str, mtime: float, size: int) -> dict | None:
-        row = self.conn.execute(
-            "SELECT mtime, size, title, artist, album, year, duration, tuning, arrangements, has_lyrics, "
-            "format, stem_count, stem_ids, tuning_name, tuning_sort_key "
-            "FROM songs WHERE filename = ?", (filename,)
-        ).fetchone()
+        cache_key = str(filename)
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT mtime, size, title, artist, album, year, duration, tuning, arrangements, has_lyrics, "
+                "format, stem_count, stem_ids, tuning_name, tuning_sort_key "
+                "FROM songs WHERE filename = ?", (cache_key,)
+            ).fetchone()
         if row and row[0] == mtime and row[1] == size and row[2]:
             return {
                 "title": row[2], "artist": row[3], "album": row[4],
@@ -838,7 +840,20 @@ def _call_library_provider(provider: object, method_name: str, **kwargs) -> Any:
             status_code=501,
             detail=f"Library provider {provider_id!r} does not support {method_name}",
         )
-    return method(**kwargs)
+    try:
+        return method(**kwargs)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        provider_id = library_providers.provider_id(provider)
+        provider_kind = str(library_providers.provider_field(provider, "kind", "") or "")
+        if provider_kind == "remote":
+            detail = f"This source appears to be offline ({provider_id})."
+            message = str(exc).strip()
+            if message:
+                detail = f"{detail} {message}"
+            raise HTTPException(status_code=503, detail=detail) from exc
+        raise
 
 
 async def _call_library_provider_async(provider: object, method_name: str, **kwargs) -> Any:
@@ -1343,7 +1358,15 @@ def _background_scan():
         except OSError as e:
             log.debug("scan: skipping %s (%s)", f, e)
             continue
-        if not meta_db.get(_rel(f), mtime, size):
+        cache_key = _rel(f)
+        try:
+            cached = meta_db.get(cache_key, mtime, size)
+        except Exception as e:
+            # Keep scanning even if a single metadata lookup fails.
+            # The file will be re-scanned and cache repaired by put().
+            log.warning("scan cache lookup failed for %s: %s", cache_key, e)
+            cached = None
+        if not cached:
             to_scan.append((f, mtime, size))
 
     if not to_scan:
@@ -1531,6 +1554,8 @@ async def startup_events():
         "get_dlc_dir": _get_dlc_dir,
         "extract_meta": _extract_meta_for_file,
         "meta_db": meta_db,
+        "get_scan_status": lambda: dict(_scan_status),
+        "get_art_cache_dir": lambda: ART_CACHE_DIR,
         "library_providers": library_providers,
         "register_library_provider": register_library_provider,
         "unregister_library_provider": unregister_library_provider,
