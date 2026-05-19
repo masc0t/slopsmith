@@ -1289,6 +1289,46 @@ async def startup_events():
         )
         return
 
+    # Sweep stranded PSARC/Demucs staging dirs from any previous run
+    # that was SIGKILL'd mid-conversion. lib/sloppak_convert.py wraps
+    # each conversion in `tempfile.mkdtemp(prefix="s2p_extract_")` /
+    # `tempfile.TemporaryDirectory(prefix="s2p_split_")` (and other
+    # `s2p_*` variants); cleanup runs only in the normal `finally` /
+    # `__exit__` path —
+    # kills (Docker shutdown timeout, OOM, `docker compose restart`
+    # mid-job) leak the staging dir, and bulk-converts can leave many
+    # GB across restarts. Run before plugin load so the sloppak-
+    # converter plugin's worker starts on a clean `/tmp` even if the
+    # previous server died holding extractions. Sits AFTER the
+    # SLOPSMITH_SKIP_STARTUP_TASKS escape hatch so test runs that
+    # need a true filesystem no-op still get one.
+    try:
+        from sloppak_convert import cleanup_stale_temp_dirs
+        # 15 minutes — safety margin chosen to cover the worst-case
+        # file-write gap of any routine in `lib/sloppak_convert.py`.
+        # The remote Demucs path (`_run_demucs_remote`) uploads the
+        # audio and then polls the server for up to 10 minutes
+        # (`for _ in range(120): time.sleep(5)`) before downloading
+        # the stems; during that poll no files are written under the
+        # staging dir. A concurrent server restart at the 5-minute
+        # mark would see an `s2p_split_*` dir with no descendants
+        # touched in >300s and delete it — breaking the live job when
+        # downloads start. 900s (15 min) clears the full 10-min poll
+        # plus a generous margin for upload and download time.
+        # For local Demucs / PSARC / WEM routines, which write
+        # continuously, the recursive mtime check correctly keeps
+        # active dirs alive; the 15-min threshold is still far shorter
+        # than the weeks a truly stranded dir would accumulate.
+        # Cost of being conservative: a kill less than 15 minutes
+        # before *this* restart leaves its staging dir for the next
+        # startup pass — fine; the next sweep catches it.
+        cleanup_stale_temp_dirs(min_age_seconds=900.0)
+    except Exception:
+        # `log.exception` (vs `log.warning(... %s, e)`) preserves the
+        # traceback — useful for distinguishing import errors,
+        # permission denials, and runtime failures inside the helper.
+        log.exception("startup temp-dir cleanup failed")
+
     _set_startup_status(
         running=True,
         phase="starting",

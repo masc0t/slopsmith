@@ -494,3 +494,180 @@ def test_ffmpeg_wav_to_ogg_does_not_retry_on_unrelated_error(tmp_path, monkeypat
     assert r.returncode == 1
     assert b"No such file or directory" in r.stderr
     assert len(cmds) == 1  # no retry
+
+
+# ── cleanup_stale_temp_dirs (issue topkoa/slopsmith-plugin-sloppak-converter#24) ─
+
+
+def test_cleanup_stale_temp_dirs_removes_s2p_prefixed_dirs(tmp_path, monkeypatch):
+    """Sweep removes every `s2p_*` directory under the temp root while
+    leaving unrelated entries (foreign dirs, regular files) untouched."""
+    monkeypatch.setattr(sloppak_convert.tempfile, "gettempdir", lambda: str(tmp_path))
+
+    leaked = [
+        tmp_path / "s2p_extract_abc",
+        tmp_path / "s2p_work_xyz",
+        tmp_path / "s2p_wem_42",
+        tmp_path / "s2p_split_demucs",
+        tmp_path / "s2p_split_zip_77",
+    ]
+    for d in leaked:
+        d.mkdir()
+        (d / "trash.bin").write_bytes(b"\x00" * 16)
+
+    foreign_dir = tmp_path / "other_app_data"
+    foreign_dir.mkdir()
+    (foreign_dir / "real.txt").write_text("keep me", encoding="utf-8")
+
+    foreign_file = tmp_path / "s2p_lookalike_file"  # file, not dir — must survive
+    foreign_file.write_text("not ours", encoding="utf-8")
+
+    removed = sloppak_convert.cleanup_stale_temp_dirs()
+    assert removed == len(leaked)
+    for d in leaked:
+        assert not d.exists(), f"{d} should have been removed"
+    assert foreign_dir.exists() and (foreign_dir / "real.txt").exists()
+    assert foreign_file.exists()
+
+
+def test_cleanup_stale_temp_dirs_respects_min_age(tmp_path, monkeypatch):
+    """When min_age_seconds is positive, only dirs older than the threshold
+    are removed — protects live conversions whose staging dir mtime is
+    current."""
+    monkeypatch.setattr(sloppak_convert.tempfile, "gettempdir", lambda: str(tmp_path))
+
+    old = tmp_path / "s2p_extract_old"
+    old.mkdir()
+    fresh = tmp_path / "s2p_extract_fresh"
+    fresh.mkdir()
+
+    # Backdate `old` by 2 hours, leave `fresh` at default mtime.
+    import os, time
+    past = time.time() - 7200
+    os.utime(old, (past, past))
+
+    removed = sloppak_convert.cleanup_stale_temp_dirs(min_age_seconds=3600)
+    assert removed == 1
+    assert not old.exists()
+    assert fresh.exists()
+
+
+def test_cleanup_stale_temp_dirs_uses_nested_mtime_as_activity_signal(
+    tmp_path, monkeypatch
+):
+    """A live Demucs job writes to files under nested subdirectories
+    (`s2p_split_xxx/model/track/stem.wav`); the *top* dir's mtime is
+    stale even though the job is actively writing. The cleanup must
+    use the deepest recent mtime in the tree as its activity signal,
+    or it would delete in-flight staging dirs of sibling instances."""
+    monkeypatch.setattr(sloppak_convert.tempfile, "gettempdir", lambda: str(tmp_path))
+
+    live = tmp_path / "s2p_split_active"
+    live.mkdir()
+    nested = live / "htdemucs_6s" / "song_a"
+    nested.mkdir(parents=True)
+    (nested / "vocals.wav").write_bytes(b"freshly-written")
+
+    # Backdate every directory in the tree — top dir, intermediate dirs,
+    # and the immediate parent of the leaf — so that only the leaf file
+    # itself has a recent mtime. A naive `entry.stat().st_mtime` check
+    # on the top dir would conclude this staging dir is stale and delete
+    # it; the recursive walk must find the recent leaf and preserve it.
+    import os, time
+    past = time.time() - 7200
+    os.utime(live, (past, past))
+    os.utime(live / "htdemucs_6s", (past, past))
+    os.utime(nested, (past, past))
+
+    removed = sloppak_convert.cleanup_stale_temp_dirs(min_age_seconds=300.0)
+    assert removed == 0
+    assert live.exists()
+    assert (nested / "vocals.wav").exists()
+
+
+def test_cleanup_stale_temp_dirs_handles_mid_iteration_oserror(
+    tmp_path, monkeypatch
+):
+    """`iterdir()` returns a lazy generator; an `OSError` from the
+    underlying `scandir` can fire mid-walk (temp root unmounted, fs
+    glitch). The helper must swallow it and return whatever it had
+    already removed, not let it bubble out and crash startup."""
+    monkeypatch.setattr(sloppak_convert.tempfile, "gettempdir", lambda: str(tmp_path))
+
+    good = tmp_path / "s2p_extract_first"
+    good.mkdir()
+
+    def _flaky_iterdir(self):
+        yield good
+        raise OSError("simulated scandir failure mid-iteration")
+
+    monkeypatch.setattr(sloppak_convert.Path, "iterdir", _flaky_iterdir)
+
+    # Must not raise.
+    removed = sloppak_convert.cleanup_stale_temp_dirs()
+    assert removed == 1
+    assert not good.exists()
+
+
+def test_newest_mtime_within_mid_walk_oserror_preserves_staging_dir(
+    tmp_path, monkeypatch
+):
+    """If `rglob` raises mid-iteration, `_newest_mtime_within` must return
+    ``None`` (unknown activity) rather than a partial mtime.  The caller
+    then skips deletion, so an in-flight staging dir is not removed even
+    when its top-level mtime appears stale."""
+    monkeypatch.setattr(sloppak_convert.tempfile, "gettempdir", lambda: str(tmp_path))
+
+    stale_dir = tmp_path / "s2p_split_inflight"
+    stale_dir.mkdir()
+
+    # Backdate the top dir to look ancient.
+    import os, time
+    past = time.time() - 7200
+    os.utime(stale_dir, (past, past))
+
+    # Patch rglob to raise mid-iteration so _newest_mtime_within cannot
+    # determine whether a recent leaf exists.
+    original_rglob = sloppak_convert.Path.rglob
+
+    def _failing_rglob(self, pattern):
+        if self == stale_dir:
+            raise OSError("simulated rglob failure mid-walk")
+        return original_rglob(self, pattern)
+
+    monkeypatch.setattr(sloppak_convert.Path, "rglob", _failing_rglob)
+
+    # min_age_seconds > 0 so the age check runs; rglob failure must cause
+    # the dir to be skipped (not deleted).
+    removed = sloppak_convert.cleanup_stale_temp_dirs(min_age_seconds=300.0)
+    assert removed == 0
+    assert stale_dir.exists()
+
+
+def test_cleanup_stale_temp_dirs_returns_zero_when_temp_root_missing(monkeypatch, tmp_path):
+    """A non-existent temp root reports 0 removals and doesn't raise."""
+    fake_root = tmp_path / "does_not_exist"
+    monkeypatch.setattr(sloppak_convert.tempfile, "gettempdir", lambda: str(fake_root))
+    assert sloppak_convert.cleanup_stale_temp_dirs() == 0
+
+
+def test_cleanup_stale_temp_dirs_skips_symlinks(tmp_path, monkeypatch):
+    """A symlink whose name happens to start with the s2p_ prefix is left
+    alone — we only ever create real directories, so anything else is
+    foreign and must not be followed or deleted."""
+    monkeypatch.setattr(sloppak_convert.tempfile, "gettempdir", lambda: str(tmp_path))
+
+    target = tmp_path / "important_target"
+    target.mkdir()
+    (target / "do_not_delete.txt").write_text("safety", encoding="utf-8")
+
+    link = tmp_path / "s2p_looks_like_ours"
+    try:
+        link.symlink_to(target, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlinks not supported on this platform / by this user")
+
+    removed = sloppak_convert.cleanup_stale_temp_dirs()
+    assert removed == 0
+    assert link.exists()
+    assert target.exists() and (target / "do_not_delete.txt").exists()

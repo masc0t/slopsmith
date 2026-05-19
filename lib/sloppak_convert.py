@@ -38,6 +38,13 @@ from audio import find_wem_files, _vgmstream_cmd, _ffmpeg_cmd, _ffmpeg_wav_to_og
 ProgressCB = Optional[Callable[[float, str, str], None]]
 
 
+# Prefix shared by every staging directory this module creates:
+# `s2p_extract_`, `s2p_work_`, `s2p_wem_`, `s2p_split_`, `s2p_split_zip_`.
+# `cleanup_stale_temp_dirs()` keys off this so a single sweep covers
+# everything we leak when the host process is killed mid-conversion.
+_TEMP_DIR_PREFIX = "s2p_"
+
+
 # ── Shared helpers ────────────────────────────────────────────────────────────
 
 def sanitize_stem(name: str) -> str:
@@ -145,6 +152,167 @@ def _zip_dir(src_dir: Path, out_zip: Path) -> None:
         for f in src_dir.rglob("*"):
             if f.is_file():
                 zf.write(f, f.relative_to(src_dir).as_posix())
+
+
+def _newest_mtime_within(dir_path: Path) -> float | None:
+    """Return the most recent mtime found anywhere inside `dir_path`
+    (including the directory itself), or ``None`` if:
+
+    * ``stat()`` failed on the directory entry itself, or
+    * the recursive ``rglob`` walk raised an ``OSError`` mid-iteration.
+
+    Callers treat ``None`` as "unknown activity — do not delete".
+    Returning a partial mtime when the walk was interrupted is unsafe:
+    traversal may have stopped before reaching a recently-written leaf,
+    causing an under-estimate that would incorrectly classify an
+    in-flight staging dir as stale.
+
+    Directory mtime on its own is not a reliable activity signal —
+    it advances when direct children are added/removed/renamed but
+    NOT when files deeper in the tree are written. A Demucs job
+    writing under `s2p_split_xxx/htdemucs_6s/<track>/` looks idle
+    from the top directory's perspective even mid-run. Walking
+    `rglob("*")` and taking the max mtime gives us a real
+    "any descendant touched recently" signal. Staging dirs in this
+    module hold tens to a few hundred files at most, so the walk
+    is cheap; individual entries that fail to stat are skipped
+    rather than aborting the whole comparison."""
+    try:
+        newest = dir_path.stat().st_mtime
+    except OSError:
+        return None
+    try:
+        for child in dir_path.rglob("*"):
+            try:
+                mtime = child.stat().st_mtime
+            except OSError:
+                continue
+            if mtime > newest:
+                newest = mtime
+    except OSError:
+        # rglob can raise mid-iteration on a transient I/O error.
+        # Returning the partial mtime accumulated so far is unsafe:
+        # if traversal stopped before reaching a recently-written leaf
+        # we would under-estimate the newest mtime and could delete an
+        # in-flight staging dir. Returning None signals the caller to
+        # skip this entry entirely (treat unknown activity as active).
+        log.debug("_newest_mtime_within: walk of %s failed, treating as active", dir_path)
+        return None
+    return newest
+
+
+def cleanup_stale_temp_dirs(min_age_seconds: float = 0.0) -> int:
+    """Sweep `tempfile.gettempdir()` of orphaned `s2p_*` staging dirs left
+    behind by killed conversions.
+
+    Each convert / split routine in this module wraps its work in a
+    `tempfile.mkdtemp` / `tempfile.TemporaryDirectory` whose prefix
+    starts with `_TEMP_DIR_PREFIX` (the per-routine prefixes are the
+    specific strings `s2p_extract_`, `s2p_work_`, `s2p_wem_`,
+    `s2p_split_`, and `s2p_split_zip_` — the shared `s2p_` head is
+    what we match against here so a single sweep covers them all).
+    Cleanup of those dirs relies on a `finally` / context-manager
+    `__exit__`. Those guarantees do NOT hold if the host process is
+    SIGKILL'd (Docker shutdown timeout, OOM kill, `docker compose
+    restart` while a job is mid-flight), and the dirs accumulate
+    forever. A bulk-convert run that's restarted a few times can
+    leave many GB of leftover PSARC extractions under `/tmp` on a
+    long-lived container.
+
+    Intended to be called once at host startup, BEFORE any new
+    conversion runs in *this* process. Note that startup of this
+    process does NOT guarantee filesystem exclusivity:
+
+    - A second slopsmith instance can share `tempfile.gettempdir()`
+      (containers writing to a host-mounted `/tmp`, two instances
+      run on the same workstation, rolling-restart deployments
+      where the old and new processes overlap briefly).
+    - An external cleanup pass (cron `tmpwatch`, container init
+      hooks) can race with this one.
+
+    `min_age_seconds` is the safety knob for that. The "age" signal
+    is the most recent mtime found anywhere inside the staging dir
+    (recursive walk), NOT the top-level dir's own mtime — directory
+    mtime only advances when direct children are created / removed
+    / renamed, so a long Demucs run that writes under
+    `s2p_split_xxx/htdemucs_6s/track/` would leave the top dir's
+    own mtime stale even while the job is actively writing.
+    Recursive `rglob` over a staging dir is cheap (~tens to a few
+    hundred files for a real conversion) and gives us a reliable
+    "any descendant touched within the threshold" gate.
+
+    Pass a value safely larger than the longest stretch of "no
+    visible writes anywhere in the tree" a live conversion might
+    have. Server startup hands in 900s (15 minutes), which covers
+    the remote Demucs polling window (up to 10 minutes with no
+    file writes while the server-side job runs) plus margin for
+    upload and download time. For local Demucs / PSARC / WEM
+    routines that write continuously, the recursive mtime check
+    keeps active dirs alive regardless of threshold.
+    The default of 0 is appropriate only for callers who can prove
+    filesystem exclusivity (e.g. test harnesses with isolated
+    `tmp_path` fixtures).
+
+    For truly hostile shared-`/tmp` environments, the safer answer
+    is a per-instance temp root (override via `TMPDIR`); this
+    helper is a best-effort backstop, not a substitute.
+
+    Returns the number of directories removed."""
+    temp_root = Path(tempfile.gettempdir())
+    if not temp_root.is_dir():
+        return 0
+
+    import time
+    now = time.time()
+    removed = 0
+    # Stream the directory listing rather than materialize the whole
+    # set up front — `/tmp` can hold many thousands of entries on a
+    # busy host, and we only ever look at one at a time. `iterdir()`
+    # returns a lazy generator, so an `OSError` from the underlying
+    # `scandir` can be raised either at construction OR mid-iteration
+    # (e.g., the temp dir is unmounted while we're walking it). Wrap
+    # the whole `for` so either path lands the helper on the same
+    # graceful "give up and report what we got" branch — startup must
+    # not crash because /tmp had a transient hiccup.
+    try:
+        for entry in temp_root.iterdir():
+            if not entry.name.startswith(_TEMP_DIR_PREFIX):
+                continue
+            # Skip files / symlinks — we only ever create directories with
+            # this prefix, so anything else under that name is foreign.
+            if entry.is_symlink() or not entry.is_dir():
+                continue
+            if min_age_seconds > 0:
+                newest = _newest_mtime_within(entry)
+                if newest is None:
+                    # Stat failed entirely — safer to skip than to delete
+                    # a directory we can't read; the next sweep can retry.
+                    continue
+                if (now - newest) < min_age_seconds:
+                    continue
+            try:
+                shutil.rmtree(entry, ignore_errors=False)
+                removed += 1
+            except FileNotFoundError:
+                # Race: another process / a concurrent startup removed the
+                # directory between `iterdir()` and the `rmtree`. Benign —
+                # the end state is what we wanted anyway, so DEBUG only.
+                log.debug("cleanup_stale_temp_dirs: %s vanished before removal", entry)
+            except OSError as e:
+                # A locked file on Windows or a permissions hiccup
+                # shouldn't crash startup; log at WARNING and move on so
+                # operators can see real failures (vs the benign race
+                # above) in the log.
+                log.warning("cleanup_stale_temp_dirs: could not remove %s: %s", entry, e)
+    except OSError as e:
+        # `iterdir()` / `scandir` failed either at construction or
+        # mid-iteration. Whatever we already removed stays counted;
+        # the next startup pass will retry.
+        log.debug("cleanup_stale_temp_dirs: listing %s failed: %s", temp_root, e)
+    if removed:
+        log.info("cleanup_stale_temp_dirs: removed %d orphaned dir(s) under %s",
+                 removed, temp_root)
+    return removed
 
 
 def _remove_path(p: Path) -> None:
