@@ -498,6 +498,62 @@ function _trapFocusInModal(modal) {
     });
 }
 
+// Styled async confirm dialog. Returns a Promise<boolean>. For destructive
+// prompts pass `danger: true` — confirm button turns red and Cancel gets
+// initial focus so an accidental Enter won't fire the action. `body` is
+// inserted as HTML so callers can use formatting; callers are responsible
+// for escaping any user-supplied content in it (use _escAttr).
+function _confirmDialog({ title, body = '', confirmText = 'Confirm', cancelText = 'Cancel', danger = false } = {}) {
+    return new Promise((resolve) => {
+        const previouslyFocused = document.activeElement;
+        const modal = document.createElement('div');
+        modal.className = 'slopsmith-modal fixed inset-0 z-[250] flex items-center justify-center bg-black/70 backdrop-blur-sm';
+        modal.setAttribute('role', 'alertdialog');
+        modal.setAttribute('aria-modal', 'true');
+        modal.setAttribute('aria-label', title || 'Confirm');
+        const confirmClass = danger
+            ? 'flex-1 bg-red-600 hover:bg-red-500 px-4 py-2 rounded-xl text-sm font-semibold text-white transition focus:outline-none focus:ring-2 focus:ring-red-400/60'
+            : 'flex-1 bg-accent hover:bg-accent-light px-4 py-2 rounded-xl text-sm font-semibold text-white transition focus:outline-none focus:ring-2 focus:ring-accent/60';
+        modal.innerHTML = `
+            <div class="bg-dark-700 border border-gray-700 rounded-2xl p-6 w-full max-w-sm mx-4 shadow-2xl">
+                <h3 class="text-lg font-bold text-white mb-3">${_escAttr(title || '')}</h3>
+                <div class="mb-5">${body}</div>
+                <div class="flex gap-3">
+                    <button type="button" data-confirm class="${confirmClass}">${_escAttr(confirmText)}</button>
+                    <button type="button" data-cancel class="px-4 py-2 bg-dark-600 hover:bg-dark-500 rounded-xl text-sm text-gray-300 transition focus:outline-none focus:ring-2 focus:ring-gray-500/40">${_escAttr(cancelText)}</button>
+                </div>
+            </div>`;
+        document.body.appendChild(modal);
+
+        function finish(result) {
+            modal.remove();
+            document.removeEventListener('keydown', onKey, true);
+            if (previouslyFocused && document.body.contains(previouslyFocused)) {
+                try { previouslyFocused.focus({ preventScroll: true }); } catch {}
+            }
+            resolve(result);
+        }
+        function onKey(e) {
+            if (e.key === 'Escape') { e.preventDefault(); e.stopImmediatePropagation(); finish(false); }
+            else if (e.key === 'Enter' && document.activeElement === modal.querySelector('[data-confirm]')) {
+                e.preventDefault(); finish(true);
+            }
+        }
+        modal.addEventListener('click', (e) => {
+            if (e.target === modal) finish(false);
+            else if (e.target.closest('[data-confirm]')) finish(true);
+            else if (e.target.closest('[data-cancel]')) finish(false);
+        });
+        document.addEventListener('keydown', onKey, true);
+        _trapFocusInModal(modal);
+        // Focus Cancel by default for destructive prompts so an accidental
+        // Enter / Space won't fire the dangerous action; otherwise focus
+        // the confirm button so Enter accepts.
+        const focusTarget = modal.querySelector(danger ? '[data-cancel]' : '[data-confirm]');
+        if (focusTarget) focusTarget.focus({ preventScroll: true });
+    });
+}
+
 // Shortcut cheat-sheet overlay. Opens on `?` (Shift+/), closes on
 // Esc (handled by the generic modal close path) or on backdrop /
 // close-button click. The list mirrors the canonical shortcut table
@@ -860,6 +916,9 @@ async function showScreen(id) {
         const audio = document.getElementById('audio');
         audio.pause();
         audio.src = '';
+        window._currentSongAudio = null;
+        // Reloading any song later should get a fresh JUCE routing attempt.
+        window._clearJuceRerouteMemo?.();
         isPlaying = false;
         document.getElementById('btn-play').textContent = '▶ Play';
     }
@@ -883,7 +942,7 @@ const _LIB_SORT_VALUES = new Set([
     'artist', 'artist-desc', 'title', 'title-desc',
     'recent', 'year-desc', 'year', 'tuning',
 ]);
-const _LIB_FORMAT_VALUES = new Set(['', 'psarc', 'sloppak']);
+const _LIB_FORMAT_VALUES = new Set(['', 'psarc', 'sloppak', 'loose']);
 // Tree-view expand/collapse persistence. Three states per tree:
 //   '1'  → user asked to expand all
 //   '0'  → user asked to collapse all
@@ -1381,6 +1440,9 @@ function formatBadge(fmt, stemCount) {
     if (fmt === 'sloppak') {
         return `<span class="fmt-badge absolute top-2 right-2 px-1.5 py-0.5 rounded text-[10px] font-bold bg-green-900/80 text-green-200 border border-green-700">SLOPPAK</span>`;
     }
+    if (fmt === 'loose') {
+        return `<span class="fmt-badge absolute top-2 right-2 px-1.5 py-0.5 rounded text-[10px] font-bold bg-amber-900/80 text-amber-200 border border-amber-700">FOLDER</span>`;
+    }
     return `<span class="fmt-badge absolute top-2 right-2 px-1.5 py-0.5 rounded text-[10px] font-bold bg-blue-900/80 text-blue-200 border border-blue-700">PSARC</span>`;
 }
 
@@ -1390,6 +1452,9 @@ function formatBadgeInline(fmt, stemCount) {
     }
     if (fmt === 'sloppak') {
         return `<span class="px-1.5 py-0.5 rounded text-[10px] font-bold bg-green-900/60 text-green-300">SLOPPAK</span>`;
+    }
+    if (fmt === 'loose') {
+        return `<span class="px-1.5 py-0.5 rounded text-[10px] font-bold bg-amber-900/60 text-amber-300">FOLDER</span>`;
     }
     return `<span class="px-1.5 py-0.5 rounded text-[10px] font-bold bg-blue-900/60 text-blue-300">PSARC</span>`;
 }
@@ -1889,7 +1954,11 @@ async function loadSettings() {
 let _avOffsetMs = 0;
 let _avSaveDebounce = null;
 function setAvOffsetMs(ms, skipPersist) {
-    _avOffsetMs = Number(ms) || 0;
+    // Clamp to the same bounds the Settings/player-bar sliders enforce
+    // (-1000..1000 ms). Defends against bad values from /api/settings
+    // landing as `value` on <input type=range>.
+    const n = Number(ms);
+    _avOffsetMs = Math.max(-1000, Math.min(1000, Number.isFinite(n) ? n : 0));
     // Drive the highway's render-time shift. getTime() still returns
     // the audio-aligned chart time so plugins (note detection, etc.)
     // keep scoring against the real chart clock regardless of visual
@@ -1900,6 +1969,14 @@ function setAvOffsetMs(ms, skipPersist) {
     if (avSlider) avSlider.value = _avOffsetMs;
     const avVal = document.getElementById('setting-av-offset-val');
     if (avVal) avVal.textContent = Math.round(_avOffsetMs);
+    // Sync the inline player-bar slider (live-tunable while playing)
+    const playerAvSlider = document.getElementById('player-av-offset-slider');
+    if (playerAvSlider) playerAvSlider.value = _avOffsetMs;
+    const playerAvLabel = document.getElementById('player-av-offset-label');
+    if (playerAvLabel) {
+        const rounded = Math.round(_avOffsetMs);
+        playerAvLabel.textContent = `${rounded >= 0 ? '+' : ''}${rounded}ms`;
+    }
     // Update the player HUD readout (hidden when offset = 0 to
     // avoid clutter; the keyboard shortcut is documented in the
     // Settings help text so it stays discoverable).
@@ -2372,6 +2449,191 @@ async function exportDiagnostics() {
     }
 }
 
+async function uploadSongs(fileList) {
+    if (!fileList || fileList.length === 0) return;
+    const all = Array.from(fileList);
+    // Optional UI element — only present when on the Settings screen.
+    // The navbar entry triggers uploads from any screen, where these aren't.
+    const status = document.getElementById('rescan-status');
+    const setStatus = (s) => { if (status) status.textContent = s; };
+
+    // Client-side extension filter so we don't waste a round-trip on
+    // clearly-invalid picks. The server validates again.
+    const failures = [];
+    const files = [];
+    for (const f of all) {
+        const lower = f.name.toLowerCase();
+        if (lower.endsWith('.psarc') || lower.endsWith('.sloppak')) {
+            files.push(f);
+        } else {
+            failures.push(`${f.name}: only .psarc or .sloppak accepted`);
+        }
+    }
+    if (files.length === 0) {
+        if (failures.length) alert(failures.join('\n'));
+        return;
+    }
+
+    // The backend caps batches at _MAX_UPLOAD_FILES (50). Chunk if needed so a
+    // big drag-and-drop of an album folder still works end-to-end.
+    const BATCH = 50;
+    const chunks = [];
+    for (let i = 0; i < files.length; i += BATCH) chunks.push(files.slice(i, i + BATCH));
+
+    let uploaded = 0;
+
+    const postChunk = async (chunk, overwrite) => {
+        const form = new FormData();
+        for (const f of chunk) form.append('file', f);
+        const url = '/api/songs/upload' + (overwrite ? '?overwrite=1' : '');
+        const resp = await fetch(url, { method: 'POST', body: form });
+        if (!resp.ok) {
+            let data = {};
+            try { data = await resp.json(); } catch (_) {}
+            // Whole-request rejection (DLC misconfig, payload too large, etc.).
+            throw new Error(data.error || resp.statusText || `HTTP ${resp.status}`);
+        }
+        const body = await resp.json();
+        return body.results || [];
+    };
+
+    for (let i = 0; i < chunks.length; i++) {
+        const chunk = chunks[i];
+        const label = chunks.length > 1
+            ? `Uploading batch ${i + 1}/${chunks.length} (${chunk.length} files)...`
+            : `Uploading ${chunk.length} file${chunk.length === 1 ? '' : 's'}...`;
+        setStatus(label);
+
+        let results;
+        try {
+            results = await postChunk(chunk, false);
+        } catch (e) {
+            for (const f of chunk) failures.push(`${f.name}: ${e.message}`);
+            continue;
+        }
+
+        // Index file objects by name so a follow-up overwrite request can
+        // resend the same blobs. Names within a chunk are unique on disk
+        // (DLC dir is flat for this purpose), but two distinct user picks
+        // could share a name — Map.set keeps the last one, which matches
+        // server-side last-write-wins semantics.
+        const byName = new Map(chunk.map(f => [f.name, f]));
+
+        const conflicts = [];
+        for (const r of results) {
+            if (r.status === 'ok') {
+                uploaded++;
+            } else if (r.status === 'exists') {
+                conflicts.push(r);
+            } else {
+                failures.push(`${r.filename}: ${r.error || 'upload failed'}`);
+            }
+        }
+
+        if (conflicts.length > 0) {
+            const names = conflicts.map(c => c.filename);
+            const preview = names.slice(0, 5).join(', ') + (names.length > 5 ? `, +${names.length - 5} more` : '');
+            const ok = confirm(
+                `${conflicts.length} file${conflicts.length === 1 ? '' : 's'} already exist in your DLC folder:\n${preview}\n\nOverwrite?`
+            );
+            if (!ok) {
+                for (const c of conflicts) failures.push(`${c.filename}: skipped (already exists)`);
+                continue;
+            }
+            const retryFiles = conflicts
+                .map(c => byName.get(c.filename))
+                .filter(Boolean);
+            setStatus(`Overwriting ${retryFiles.length} file${retryFiles.length === 1 ? '' : 's'}...`);
+            let retryResults;
+            try {
+                retryResults = await postChunk(retryFiles, true);
+            } catch (e) {
+                for (const f of retryFiles) failures.push(`${f.name}: ${e.message}`);
+                continue;
+            }
+            for (const r of retryResults) {
+                if (r.status === 'ok') uploaded++;
+                else failures.push(`${r.filename}: ${r.error || 'upload failed'}`);
+            }
+        }
+    }
+
+    if (failures.length === 0) {
+        setStatus(`Uploaded ${uploaded} file${uploaded === 1 ? '' : 's'}. Scanning...`);
+    } else {
+        // Denominator is the full user selection (`all.length`), not just the
+        // post-filter `files.length`. Otherwise picking one valid file plus
+        // one `.txt` would show "Uploaded 1/1" with a failure listed below,
+        // overstating the success rate.
+        const total = all.length;
+        const msg = `Uploaded ${uploaded}/${total}. ${failures.length} failed:\n` + failures.join('\n');
+        alert(msg);
+        setStatus(`Uploaded ${uploaded}/${total}, ${failures.length} failed.`);
+    }
+    if (uploaded > 0) {
+        // Server kicked off a background scan after the batch finished; poll
+        // for completion and refresh the library when it finishes.
+        _pollScanAndRefresh(status);
+    }
+}
+
+let _uploadScanPoller = null;
+
+function _pollScanAndRefresh(statusEl) {
+    const setStatus = (s) => { if (statusEl) statusEl.textContent = s; };
+    if (_uploadScanPoller) _uploadScanPoller.stop();
+
+    const MAX_FAILURES = 5;
+    const INTERVAL_MS = 1000;
+    let stopped = false;
+    let timerId = null;
+    let failures = 0;
+    const stop = () => {
+        stopped = true;
+        if (timerId) { clearTimeout(timerId); timerId = null; }
+        if (_uploadScanPoller && _uploadScanPoller.stop === stop) _uploadScanPoller = null;
+    };
+    _uploadScanPoller = { stop };
+
+    const tick = async () => {
+        timerId = null;
+        try {
+            const sr = await fetch('/api/scan-status');
+            if (!sr.ok) throw new Error(`HTTP ${sr.status}`);
+            const sd = await sr.json();
+            if (stopped) return;
+            failures = 0;
+            if (sd.running) {
+                const cur = sd.current ? ` · ${sd.current}` : '';
+                setStatus(`${sd.done} / ${sd.total} scanned${cur}...`);
+            } else {
+                stop();
+                if (sd.error) setStatus(`Error: ${sd.error}`);
+                else setStatus('Done!');
+                _treeStats = null;
+                _tuningNames = null;
+                // Mirror the delete path: refresh whichever collection is
+                // currently visible. Overwriting a favorited song while
+                // viewing Favorites otherwise leaves a stale entry.
+                const activeScreen = document.querySelector('.screen.active');
+                if (activeScreen?.id === 'favorites') loadFavorites();
+                else loadLibrary();
+                return;
+            }
+        } catch (e) {
+            if (stopped) return;
+            failures++;
+            if (failures >= MAX_FAILURES) {
+                stop();
+                setStatus(`Scan status unavailable: ${e.message || e}`);
+                return;
+            }
+        }
+        if (!stopped) timerId = setTimeout(tick, INTERVAL_MS);
+    };
+    timerId = setTimeout(tick, INTERVAL_MS);
+}
+
 async function rescanLibrary() {
     const btn = document.getElementById('btn-rescan');
     const status = document.getElementById('rescan-status');
@@ -2631,6 +2893,314 @@ const jucePlayer = {
     },
 };
 window.jucePlayer = jucePlayer;
+
+// ── Engine start/stop → re-route song audio (HTML5 ⇄ JUCE) ──────────────────
+// window._juceMode is otherwise decided once, at song-load time (highway.js),
+// from isAudioRunning(). If the JUCE audio engine is started or stopped *after*
+// a song is already loaded (e.g. the user presses CHAIN / AMP), that decision
+// goes stale: the song stays on the HTML5 <audio> element while the engine
+// grabs the device in exclusive mode (audible guitar, silent song), or it stays
+// on a dead JUCE backing transport. This watcher migrates the loaded song
+// between the two paths whenever the engine's running state changes, preserving
+// playback position and play/pause state.
+(function _installJuceEngineRoutingWatcher() {
+    const juceApi = window.slopsmithDesktop?.audio;
+    if (!juceApi || typeof juceApi.isAudioRunning !== 'function') return;
+
+    let _rerouteInFlight = false;
+    // URL that JUCE's loadBackingTrack *explicitly rejected* (ok === false —
+    // e.g. a codec it can't read). The poll below would otherwise retry the
+    // same doomed track every 350 ms; remember it and skip until the song
+    // changes. Only a hard JUCE reject is memoised here — transient failures
+    // (a network blip on /api/audio-local-path, an isAudioRunning() race
+    // during a device restart) are deliberately NOT memoised so they retry.
+    let _rerouteRejectedUrl = null;
+    // Returns true when window._currentSongAudio no longer references the exact
+    // snapshot object captured at reroute entry — i.e. the song was swapped (or
+    // cleared) mid-flight. Staleness is detected by object-reference identity,
+    // not by URL value.
+    function _isStale(songAudio) {
+        return window._currentSongAudio !== songAudio;
+    }
+
+    // Migrates the loaded song from the HTML5 element onto the JUCE backing
+    // transport. Throws only on transient/unexpected failures.
+    // `songAudio` is the snapshot captured at reroute entry; if it stops being
+    // the current song mid-flight we abort without mutating global routing.
+    // Returns a distinct string outcome — the caller must NOT conflate them:
+    //   'switched' — song now plays via JUCE.
+    //   'rejected' — JUCE hard-rejected the track (codec). Caller memoises it.
+    //   'stale'    — the loaded song changed mid-flight; aborted, NOT memoised.
+    // (a transient transport-start failure throws instead — also not memoised.)
+    async function _switchHtml5ToJuce(songAudio) {
+        const url = songAudio.url;
+        const wasPlaying = isPlaying;
+        const pos = audio.currentTime || 0;
+        // Mark a reroute in progress so the <audio> 'play'/'pause' listeners
+        // suppress their song:play / song:pause emissions: the migration is
+        // transparent — playback genuinely continues — so plugin state and
+        // window.slopsmith.isPlaying must NOT flip. This also silences the
+        // "Audio paused unexpectedly" diagnostic. A REFCOUNT (not a boolean)
+        // lets an overlapping reroute's deferred release coexist: each switch
+        // increments on entry and decrements after its own timeout; listeners
+        // treat any count > 0 as "reroute active".
+        window._juceRerouteInProgress = (window._juceRerouteInProgress || 0) + 1;
+        audio.pause();
+        try {
+            const res = await fetch(`/api/audio-local-path?url=${encodeURIComponent(url)}`);
+            if (!res.ok) throw new Error('HTTP ' + res.status);
+            const { path } = await res.json();
+            if (_isStale(songAudio)) return 'stale';   // song changed mid-fetch
+            const ok = await juceApi.loadBackingTrack(path);
+            if (ok === false) {
+                // JUCE rejected the track — stay on HTML5, resume if needed.
+                console.warn('[juce-reroute] loadBackingTrack rejected; staying on HTML5');
+                // Only resume if the element still has a source. In the normal
+                // flow audio.src is intact here, but a prior HTML5→JUCE switch
+                // clears it — re-point + load before resuming so a bounced
+                // reroute doesn't try to play() an empty element.
+                if (isPlaying && !_isStale(songAudio)) {
+                    if (!audio.src) { audio.src = url; audio.load(); }
+                    try { await audio.play(); } catch (_) { /* ignore */ }
+                }
+                return 'rejected';
+            }
+            if (_isStale(songAudio)) return 'stale';
+            const dur = await juceApi.getBackingDuration();
+            await juceApi.seekBacking(pos);
+            // Start the new transport BEFORE committing global routing state, so
+            // a play() failure can't leave us in "JUCE mode, nothing playing"
+            // (the silent-song state this watcher exists to prevent).
+            // jucePlayer.play() RETURNS false (it does not throw) when
+            // startBacking fails — check the result, don't just await it.
+            // A play() failure is a TRANSIENT transport-start issue, not a hard
+            // codec reject: throw (rather than returning 'rejected') so the
+            // caller's catch path handles it WITHOUT memoising the URL, leaving
+            // it free to retry on the next poll. Only 'rejected' is memoised.
+            // Re-read isPlaying as late as possible: the user can press Pause
+            // during the multi-await fetch/IPC chain above. Starting the JUCE
+            // transport off a stale `wasPlaying` snapshot would resume a song
+            // the user just paused. Only start it if playback is still wanted.
+            if (isPlaying) {
+                const started = await jucePlayer.play();
+                if (started === false) {
+                    if (!_isStale(songAudio) && isPlaying) {
+                        try { await audio.play(); } catch (_) { /* ignore */ }
+                    }
+                    throw new Error('jucePlayer.play() failed (transient transport start)');
+                }
+            }
+            if (_isStale(songAudio)) {
+                // Song changed while JUCE was spinning up — undo and bail.
+                await jucePlayer.pause().catch(() => {});
+                return 'stale';
+            }
+            if (window.jucePlayer) {
+                jucePlayer._dur = dur;
+                jucePlayer._pos = pos;
+                jucePlayer._pollAt = performance.now();
+            }
+            window._juceMode = true;
+            window._juceAudioUrl = url;
+            audio.src = '';
+            try {
+                const apply = window.slopsmith?.audio?.applySongVolume;
+                if (typeof apply === 'function') await apply();
+            } catch (_) { /* best-effort */ }
+            console.log('[juce-reroute] HTML5 → JUCE @', pos.toFixed(2), 's playing=', wasPlaying);
+            return 'switched';
+        } catch (err) {
+            // Path lookup, JSON parse, or a JUCE IPC call threw partway through.
+            // audio.pause() already ran above; restore HTML5 playback so a
+            // previously playing song isn't left silently paused, then re-throw
+            // so the caller logs it. The caller does NOT memoise this URL —
+            // transient failures must retry on the next poll.
+            if (isPlaying && !window._juceMode && !_isStale(songAudio)) {
+                if (!audio.src) { audio.src = url; audio.load(); }
+                try { await audio.play(); } catch (_) { /* ignore */ }
+            }
+            throw err;
+        } finally {
+            // Clearing audio.src above dispatches a 'pause' event in a later
+            // task, after this synchronous finally. Defer the refcount
+            // decrement so that trailing event is still suppressed; a 0ms
+            // timeout lands after the pending pause-event task. Decrementing
+            // (rather than zeroing) leaves any overlapping reroute's own
+            // suppression intact.
+            setTimeout(() => {
+                window._juceRerouteInProgress = Math.max(
+                    0, (window._juceRerouteInProgress || 1) - 1);
+            }, 0);
+        }
+    }
+
+    async function _switchJuceToHtml5(songAudio) {
+        const url = songAudio.url;
+        const wasPlaying = isPlaying;
+        const pos = (window.jucePlayer ? jucePlayer.currentTime : 0) || 0;
+        // Mark a reroute in progress (refcount) so the <audio> 'play' listener
+        // suppresses its song:play emission — the migration is transparent and
+        // playback genuinely continues, so plugin state must not flip. Held
+        // until after the (possibly deferred) audio.play() event has fired.
+        window._juceRerouteInProgress = (window._juceRerouteInProgress || 0) + 1;
+        let _suppressionReleased = false;
+        const _releaseSuppression = () => {
+            if (_suppressionReleased) return;
+            _suppressionReleased = true;
+            // Defer so the 'play' (or 'pause') event task fires while still
+            // suppressed; a 0ms timeout lands after it.
+            setTimeout(() => {
+                window._juceRerouteInProgress = Math.max(
+                    0, (window._juceRerouteInProgress || 1) - 1);
+            }, 0);
+        };
+        let _resumeScheduled = false;
+        try {
+            await jucePlayer.pause().catch(() => {});
+            if (_isStale(songAudio)) return;           // song changed mid-pause
+            window._juceMode = false;
+            window._juceAudioUrl = null;
+            audio.src = url;
+            audio.load();
+            // Resume only AFTER the seek so playback starts at `pos`, not at 0
+            // with an audible jump once metadata arrives.
+            const resumeAtPos = () => {
+                try {
+                    // The metadata event can land after a fast song switch —
+                    // bail before touching currentTime so a stale callback
+                    // doesn't seek the newly loaded song to the old position.
+                    if (_isStale(songAudio)) return;
+                    try { audio.currentTime = pos; } catch (_) { /* ignore */ }
+                    // Re-read isPlaying (not the entry snapshot): the user may
+                    // have pressed Pause during jucePlayer.pause()/metadata
+                    // load — don't resume a song they just paused.
+                    if (isPlaying) {
+                        audio.play().catch(() => { /* ignore */ });
+                    }
+                } finally {
+                    _releaseSuppression();
+                }
+            };
+            _resumeScheduled = true;
+            if (audio.readyState >= 1) {
+                resumeAtPos();
+            } else {
+                // Wait for metadata to resume at `pos`. But metadata may never
+                // arrive (bad URL, network error) — that would leak the
+                // suppression refcount and permanently silence song:play /
+                // song:pause. Guard with the element's 'error' event AND a
+                // backstop timeout; whichever fires first wins, the others are
+                // detached. _releaseSuppression is idempotent regardless.
+                let _settled = false;
+                const _onMeta = () => { finish(true); };
+                const _onErr = () => { finish(false); };
+                let _backstop;
+                function finish(reachedMetadata) {
+                    if (_settled) return;
+                    _settled = true;
+                    clearTimeout(_backstop);
+                    audio.removeEventListener('loadedmetadata', _onMeta);
+                    audio.removeEventListener('error', _onErr);
+                    if (reachedMetadata) {
+                        resumeAtPos();             // resumeAtPos releases suppression
+                    } else {
+                        _releaseSuppression();     // no resume — just release
+                    }
+                }
+                audio.addEventListener('loadedmetadata', _onMeta, { once: true });
+                audio.addEventListener('error', _onErr, { once: true });
+                // 10s is well beyond a normal local-file metadata load.
+                _backstop = setTimeout(() => { finish(false); }, 10000);
+            }
+        } finally {
+            // resumeAtPos owns the release once scheduled; if we returned
+            // early (stale, before scheduling) release here instead.
+            // _releaseSuppression is idempotent so an overlap is harmless.
+            if (!_resumeScheduled) _releaseSuppression();
+        }
+        try {
+            const apply = window.slopsmith?.audio?.applySongVolume;
+            if (typeof apply === 'function') await apply();
+        } catch (_) { /* best-effort */ }
+        console.log('[juce-reroute] JUCE → HTML5 @', pos.toFixed(2), 's playing=', wasPlaying);
+    }
+
+    async function _reevaluateJuceRouting() {
+        if (_rerouteInFlight) return;
+        const songAudio = window._currentSongAudio;
+        // Only /audio/ songs are JUCE-routable; sloppak stems stay on HTML5.
+        if (!songAudio || !songAudio.juceEligible) return;
+        // Don't race highway.js's own initial song-load routing: it owns
+        // _juceMode until _juceRoutingPromise settles. Re-running our switch
+        // concurrently would double-call loadBackingTrack for the same URL.
+        if (window._highwayJuceRoutingPending) return;
+
+        // Claim the in-flight guard SYNCHRONOUSLY, before the first await. The
+        // watcher is driven by a 350ms setInterval; if isAudioRunning() (or any
+        // later await) stalls past the poll period, a second tick would
+        // otherwise pass the `if (_rerouteInFlight) return` check above and run
+        // a concurrent switch — duplicate loadBackingTrack IPCs racing on
+        // _juceMode / audio.src. Setting it here closes that window.
+        _rerouteInFlight = true;
+        try {
+            let running;
+            try { running = await juceApi.isAudioRunning(); }
+            catch (_) { return; }
+            if (_isStale(songAudio)) return;               // song changed during IPC
+            if (!!running === !!window._juceMode) return;  // routing already consistent
+
+            const wantJuce = running && !window._juceMode;
+            // Don't keep retrying a track JUCE explicitly rejected.
+            if (wantJuce && songAudio.url === _rerouteRejectedUrl) return;
+
+            if (running) {
+                const outcome = await _switchHtml5ToJuce(songAudio);
+                // Memoise ONLY an explicit hard JUCE reject. A successful
+                // switch clears the memo; a 'stale' abort (song changed
+                // mid-flight) leaves it untouched — it must never be
+                // misclassified as a reject, even if the song object was
+                // swapped and then restored before this point.
+                if (outcome === 'rejected') {
+                    _rerouteRejectedUrl = songAudio.url;
+                } else if (outcome === 'switched') {
+                    _rerouteRejectedUrl = null;
+                }
+                // outcome === 'stale': leave _rerouteRejectedUrl as-is.
+            } else {
+                await _switchJuceToHtml5(songAudio);
+                // The engine just stopped. Clear any hard-reject memo so a
+                // later engine restart re-evaluates the track at least once —
+                // the rejection may have been a transient device/decoder state.
+                _rerouteRejectedUrl = null;
+            }
+        } catch (e) {
+            // Transient failure — log but do NOT memoise, so the next poll retries.
+            console.warn('[juce-reroute] re-route failed (will retry):', e);
+        } finally {
+            _rerouteInFlight = false;
+        }
+    }
+    window._reevaluateJuceRouting = _reevaluateJuceRouting;
+
+    // Clears the hard-reject memo. Called from the song-teardown sites that
+    // null window._currentSongAudio (showScreen, playSong) so that reloading
+    // the same file later gets a fresh routing attempt — a prior reject may
+    // have been a transient JUCE/device state, not a permanent codec issue.
+    window._clearJuceRerouteMemo = function () { _rerouteRejectedUrl = null; };
+
+    // The engine can be started/stopped from several places (the desktop Audio
+    // Engine panel, the audio_engine plugin, note_detect) and via setDevice
+    // restarts — and the contextBridge api object is frozen, so its methods
+    // can't be wrapped. Poll isAudioRunning() while a song is loaded; the check
+    // is a cheap IPC boolean and no-ops once routing is already consistent.
+    // Skip the poll while the document is hidden (background tab / minimised
+    // window) — engine toggles there will be reconciled on the first poll
+    // after the tab is visible again.
+    setInterval(() => {
+        if (document.hidden) return;
+        if (window._currentSongAudio) void _reevaluateJuceRouting();
+    }, 350);
+})();
 
 // Desktop JUCE backing uses an empty <audio> element; plugins such as Section Map
 // still seek via audio.currentTime / pause / play. Mirror those onto jucePlayer
@@ -2960,11 +3530,23 @@ function _adjustSongVolume(delta) {
 // (slopsmith#54). Delegates to audio-mixer's readSongVolume when loaded so
 // the in-memory fallback (for storage-blocked contexts) is authoritative.
 audio.addEventListener('loadedmetadata', () => {
-    audio.volume = (window.slopsmith?.audio?.readSongVolume?.() ?? _readSongVolume()) / 100;
+    const applySongVolume = window.slopsmith?.audio?.applySongVolume;
+    if (typeof applySongVolume === 'function') {
+        void applySongVolume();
+    } else {
+        audio.volume = (window.slopsmith?.audio?.readSongVolume?.() ?? _readSongVolume()) / 100;
+    }
 });
 
 // Debug audio issues
-audio.addEventListener('pause', () => { if (isPlaying) console.log('Audio paused unexpectedly at', audio.currentTime.toFixed(1)); });
+audio.addEventListener('pause', () => {
+    // The JUCE engine-reroute watcher pauses the element on purpose mid-migration
+    // (and the src='' it does fires a trailing async pause too); don't flag those
+    // as unexpected — the watcher holds window._juceRerouteInProgress across it.
+    if (isPlaying && !window._juceRerouteInProgress) {
+        console.log('Audio paused unexpectedly at', audio.currentTime.toFixed(1));
+    }
+});
 audio.addEventListener('error', (e) => {
     // Ignore errors from empty src (happens during song switch cleanup)
     if (!audio.src || audio.src === window.location.href) return;
@@ -2979,11 +3561,18 @@ audio.addEventListener('ended', () => {
     window.slopsmith.emit('song:ended', _songEventPayload());
 });
 audio.addEventListener('play', () => {
+    // During a JUCE engine reroute the element is paused/played as a transparent
+    // migration step — playback genuinely continues, so don't emit song:play or
+    // flip slopsmith.isPlaying (the watcher keeps the canonical state itself).
+    if (window._juceRerouteInProgress) return;
     window.slopsmith.isPlaying = true;
     window.slopsmith.emit('song:play', _songEventPayload());
 });
 audio.addEventListener('pause', () => {
     if (!isPlaying) return;
+    // Same as above: suppress the song:pause emitted by a reroute's deliberate
+    // audio.pause() — the migration is transparent to plugin play-state.
+    if (window._juceRerouteInProgress) return;
     window.slopsmith.isPlaying = false;
     window.slopsmith.emit('song:pause', _songEventPayload());
 });
@@ -3029,6 +3618,10 @@ async function playSong(filename, arrangement) {
     }
     audio.pause();
     audio.src = '';
+    // Stale until the incoming song's WS handler (highway.js) sets it again.
+    window._currentSongAudio = null;
+    // Fresh JUCE routing attempt for whatever song loads next.
+    window._clearJuceRerouteMemo?.();
     isPlaying = false;
     document.getElementById('btn-play').textContent = '▶ Play';
     document.getElementById('speed-slider').value = 100;
@@ -4682,6 +5275,10 @@ function openEditModal(songData, openerEl) {
                 <button data-edit-close
                     class="px-4 py-2 bg-dark-600 hover:bg-dark-500 rounded-xl text-sm text-gray-300 transition">Cancel</button>
             </div>
+            <div class="mt-4 pt-4 border-t border-gray-800">
+                <button data-delete-filename="${_escAttr(songData.f)}"
+                    class="w-full px-4 py-2 bg-red-900/30 hover:bg-red-900/60 border border-red-900/50 hover:border-red-700 rounded-xl text-sm text-red-300 hover:text-red-100 transition">Remove from library</button>
+            </div>
         </div>`;
     document.body.appendChild(modal);
 
@@ -4708,6 +5305,13 @@ function openEditModal(songData, openerEl) {
     document.getElementById('edit-art-wrapper').addEventListener('click', () => {
         document.getElementById('edit-art-file').click();
     });
+
+    const deleteBtn = modal.querySelector('[data-delete-filename]');
+    if (deleteBtn) {
+        deleteBtn.addEventListener('click', () => {
+            deleteSongFromModal(deleteBtn.dataset.deleteFilename);
+        });
+    }
 
     // Close on backdrop click or Cancel button; restore focus to opener.
     modal.addEventListener('click', (e) => {
@@ -4770,6 +5374,86 @@ async function saveEditModal(encodedFilename) {
     const activeScreen = document.querySelector('.screen.active');
     if (activeScreen?.id === 'favorites') loadFavorites();
     else loadLibrary();
+}
+
+async function deleteSongFromModal(filename) {
+    const title = (document.getElementById('edit-title')?.value || filename).trim();
+    const ok = await _confirmDialog({
+        title: 'Remove from library?',
+        body: `<p class="text-sm text-gray-300">Remove <span class="font-semibold text-white">${_escAttr(title)}</span> from your library?</p>
+               <p class="text-xs text-red-400/90 mt-2">This permanently deletes the file from disk. This cannot be undone.</p>`,
+        confirmText: 'Remove',
+        cancelText: 'Cancel',
+        danger: true,
+    });
+    if (!ok) return;
+    let resp;
+    try {
+        resp = await fetch(`/api/song/${encodeURIComponent(filename)}`, { method: 'DELETE' });
+    } catch (e) {
+        alert(`Delete failed: ${e.message}`);
+        return;
+    }
+    if (!resp.ok) {
+        let msg = resp.statusText;
+        try { msg = (await resp.json()).error || msg; } catch (_) {}
+        alert(`Delete failed: ${msg}`);
+        return;
+    }
+    const modal = document.getElementById('edit-modal');
+    if (modal) modal.remove();
+    _treeStats = null;
+    _favTreeStats = null;
+    _tuningNames = null;
+
+    // Remove the deleted song's card from any currently-rendered grid/tree
+    // so the user sees it disappear without waiting for a refetch. A full
+    // loadLibrary() here would re-call loadGridPage(currentPage), which
+    // uses 'append' mode when currentPage > 0 and re-appends the same
+    // (now-shortened) page on top of what's already rendered — leaving
+    // the deleted card visible. Direct DOM removal also preserves scroll
+    // position, which a refetch from page 0 would lose.
+    _removeLibCardsForFilename(filename);
+
+    // Tree views group by artist with song counts; a single card removal
+    // leaves stale counts, so refresh the tree for whichever screen we're
+    // looking at (each tree-view renderer replaces innerHTML cleanly).
+    const activeScreen = document.querySelector('.screen.active');
+    if (activeScreen?.id === 'favorites') {
+        // loadFavorites() routes to either loadFavGridPage (always
+        // 'replace') or loadFavTreeView — both safe for a single delete.
+        loadFavorites();
+    } else if (libView === 'tree') {
+        loadTreeView();
+    }
+    // Main library grid view: DOM removal above is sufficient.
+}
+
+function _removeLibCardsForFilename(filename) {
+    // The grid uses data-play="<encoded filename>" on each card; the
+    // tree's song rows use the same attribute. encodeURIComponent
+    // matches what renderGridCards / the tree renderer emit.
+    const encoded = encodeURIComponent(filename);
+    const selector = `[data-play="${CSS.escape(encoded)}"]`;
+    let removed = 0;
+    for (const el of document.querySelectorAll(selector)) {
+        el.remove();
+        removed++;
+    }
+    if (removed === 0) return;
+    // Decrement the visible count badges that loadGridPage / loadTreeView
+    // populated. Counts come from the server's `total` so this is a
+    // best-effort estimate until the next refetch, but it keeps the
+    // displayed number consistent with what's on screen right now.
+    for (const id of ['lib-count', 'fav-count']) {
+        const el = document.getElementById(id);
+        if (!el) continue;
+        const m = (el.textContent || '').match(/^(\d+)/);
+        if (!m) continue;
+        const next = Math.max(0, parseInt(m[1], 10) - removed);
+        el.textContent = (el.textContent || '').replace(/^\d+/, String(next));
+    }
+    _bumpLibNavGeneration();
 }
 
 // Delegated click handlers
@@ -5130,7 +5814,7 @@ async function loadPlugins() {
                     Plugins
                     <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/></svg>
                 </button>
-                <div class="hidden absolute top-full left-0 mt-2 bg-dark-800 border border-gray-700 rounded-xl shadow-xl py-2 min-w-[180px] z-50" id="plugin-dropdown"></div>`;
+                <div class="hidden absolute top-full left-0 mt-2 bg-dark-800 border border-gray-700 rounded-xl shadow-xl py-2 min-w-[180px] max-h-[80vh] overflow-y-auto z-50" id="plugin-dropdown"></div>`;
             navContainer.appendChild(dropdown);
             const ddMenu = dropdown.querySelector('#plugin-dropdown');
 
@@ -5457,9 +6141,43 @@ async function bootstrapPluginsAndUi() {
     fetch('/api/version')
         .then(r => { if (!r.ok) throw new Error(); return r.json(); })
         .then(d => {
-            const el = document.getElementById('app-version');
             const v = typeof d.version === 'string' ? d.version.trim() : '';
-            if (el && v && v.toLowerCase() !== 'unknown') el.textContent = 'v' + v;
+            if (v && v.toLowerCase() !== 'unknown') {
+                const navEl = document.getElementById('app-version');
+                if (navEl) navEl.textContent = 'v' + v;
+                const aboutEl = document.getElementById('app-version-about');
+                if (aboutEl) aboutEl.textContent = 'v' + v;
+            }
+            // Defense-in-depth: server validates the env-var-supplied URLs,
+            // but the About <a href> values are configurable so the UI also
+            // rejects anything that isn't http(s) with a non-empty hostname.
+            // A bare regex prefix check would accept malformed values like
+            // "https://" — `new URL` + protocol + hostname catches them
+            // (and `hostname`, not `host`, so port-only authorities like
+            // "http://:80/path" are rejected too).
+            // The source and license links are checked independently so a
+            // rejected source_url doesn't gate a valid license_url.
+            const isSafeHref = (u) => {
+                if (typeof u !== 'string' || !u) return false;
+                try {
+                    const parsed = new URL(u);
+                    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return false;
+                    // `host` includes the port — "http://:80/path" has
+                    // host ":80" but no real hostname. `hostname` is what
+                    // we actually want.
+                    return !!parsed.hostname;
+                } catch (_) {
+                    return false;
+                }
+            };
+            if (isSafeHref(d.source_url)) {
+                const srcLink = document.getElementById('about-source-link');
+                if (srcLink) srcLink.href = d.source_url;
+            }
+            if (isSafeHref(d.license_url)) {
+                const licLink = document.getElementById('about-license-link');
+                if (licLink) licLink.href = d.license_url;
+            }
         })
         .catch(() => {});
 })();

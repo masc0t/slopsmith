@@ -31,10 +31,18 @@ import yaml
 
 from patcher import unpack_psarc
 from song import load_song, arrangement_to_wire
-from audio import find_wem_files, _vgmstream_cmd, _ffmpeg_cmd
+from tones import extract_tones_for_song
+from audio import find_wem_files, _vgmstream_cmd, _ffmpeg_cmd, _ffmpeg_wav_to_ogg
 
 
 ProgressCB = Optional[Callable[[float, str, str], None]]
+
+
+# Prefix shared by every staging directory this module creates:
+# `s2p_extract_`, `s2p_work_`, `s2p_wem_`, `s2p_split_`, `s2p_split_zip_`.
+# `cleanup_stale_temp_dirs()` keys off this so a single sweep covers
+# everything we leak when the host process is killed mid-conversion.
+_TEMP_DIR_PREFIX = "s2p_"
 
 
 # ── Shared helpers ────────────────────────────────────────────────────────────
@@ -80,10 +88,7 @@ def _wem_to_ogg(wem_path: str, out_ogg: Path) -> None:
                 f"vgmstream-cli failed: {r.stderr.decode(errors='replace')}"
             )
         out_ogg.parent.mkdir(parents=True, exist_ok=True)
-        r2 = subprocess.run(
-            [ffmpeg, "-y", "-i", str(wav), "-c:a", "libvorbis", "-q:a", "5", str(out_ogg)],
-            capture_output=True,
-        )
+        r2 = _ffmpeg_wav_to_ogg(ffmpeg, wav, out_ogg)
         if r2.returncode != 0 or not out_ogg.exists() or out_ogg.stat().st_size < 100:
             raise RuntimeError(
                 f"ffmpeg OGG encode failed: {r2.stderr.decode(errors='replace')}"
@@ -149,6 +154,189 @@ def _zip_dir(src_dir: Path, out_zip: Path) -> None:
                 zf.write(f, f.relative_to(src_dir).as_posix())
 
 
+def _newest_mtime_within(dir_path: Path) -> float | None:
+    """Return the most recent mtime found anywhere inside `dir_path`
+    (including the directory itself), or ``None`` if:
+
+    * ``stat()`` failed on the directory entry itself, or
+    * the recursive ``rglob`` walk raised an ``OSError`` mid-iteration.
+
+    Callers treat ``None`` as "unknown activity — do not delete".
+    Returning a partial mtime when the walk was interrupted is unsafe:
+    traversal may have stopped before reaching a recently-written leaf,
+    causing an under-estimate that would incorrectly classify an
+    in-flight staging dir as stale.
+
+    Directory mtime on its own is not a reliable activity signal —
+    it advances when direct children are added/removed/renamed but
+    NOT when files deeper in the tree are written. A Demucs job
+    writing under `s2p_split_xxx/htdemucs_6s/<track>/` looks idle
+    from the top directory's perspective even mid-run. Walking
+    `rglob("*")` and taking the max mtime gives us a real
+    "any descendant touched recently" signal. Staging dirs in this
+    module hold tens to a few hundred files at most, so the walk
+    is cheap; individual entries that fail to stat are skipped
+    rather than aborting the whole comparison."""
+    try:
+        newest = dir_path.stat().st_mtime
+    except OSError:
+        return None
+    try:
+        for child in dir_path.rglob("*"):
+            try:
+                mtime = child.stat().st_mtime
+            except OSError:
+                continue
+            if mtime > newest:
+                newest = mtime
+    except OSError:
+        # rglob can raise mid-iteration on a transient I/O error.
+        # Returning the partial mtime accumulated so far is unsafe:
+        # if traversal stopped before reaching a recently-written leaf
+        # we would under-estimate the newest mtime and could delete an
+        # in-flight staging dir. Returning None signals the caller to
+        # skip this entry entirely (treat unknown activity as active).
+        log.debug("_newest_mtime_within: walk of %s failed, treating as active", dir_path)
+        return None
+    return newest
+
+
+def cleanup_stale_temp_dirs(min_age_seconds: float = 0.0) -> int:
+    """Sweep `tempfile.gettempdir()` of orphaned `s2p_*` staging dirs left
+    behind by killed conversions.
+
+    Each convert / split routine in this module wraps its work in a
+    `tempfile.mkdtemp` / `tempfile.TemporaryDirectory` whose prefix
+    starts with `_TEMP_DIR_PREFIX` (the per-routine prefixes are the
+    specific strings `s2p_extract_`, `s2p_work_`, `s2p_wem_`,
+    `s2p_split_`, and `s2p_split_zip_` — the shared `s2p_` head is
+    what we match against here so a single sweep covers them all).
+    Cleanup of those dirs relies on a `finally` / context-manager
+    `__exit__`. Those guarantees do NOT hold if the host process is
+    SIGKILL'd (Docker shutdown timeout, OOM kill, `docker compose
+    restart` while a job is mid-flight), and the dirs accumulate
+    forever. A bulk-convert run that's restarted a few times can
+    leave many GB of leftover PSARC extractions under `/tmp` on a
+    long-lived container.
+
+    Intended to be called once at host startup, BEFORE any new
+    conversion runs in *this* process. Note that startup of this
+    process does NOT guarantee filesystem exclusivity:
+
+    - A second slopsmith instance can share `tempfile.gettempdir()`
+      (containers writing to a host-mounted `/tmp`, two instances
+      run on the same workstation, rolling-restart deployments
+      where the old and new processes overlap briefly).
+    - An external cleanup pass (cron `tmpwatch`, container init
+      hooks) can race with this one.
+
+    `min_age_seconds` is the safety knob for that. The "age" signal
+    is the most recent mtime found anywhere inside the staging dir
+    (recursive walk), NOT the top-level dir's own mtime — directory
+    mtime only advances when direct children are created / removed
+    / renamed, so a long Demucs run that writes under
+    `s2p_split_xxx/htdemucs_6s/track/` would leave the top dir's
+    own mtime stale even while the job is actively writing.
+    Recursive `rglob` over a staging dir is cheap (~tens to a few
+    hundred files for a real conversion) and gives us a reliable
+    "any descendant touched within the threshold" gate.
+
+    Pass a value safely larger than the longest stretch of "no
+    visible writes anywhere in the tree" a live conversion might
+    have. Server startup hands in 900s (15 minutes), which covers
+    the remote Demucs polling window (up to 10 minutes with no
+    file writes while the server-side job runs) plus margin for
+    upload and download time. For local Demucs / PSARC / WEM
+    routines that write continuously, the recursive mtime check
+    keeps active dirs alive regardless of threshold.
+    The default of 0 is appropriate only for callers who can prove
+    filesystem exclusivity (e.g. test harnesses with isolated
+    `tmp_path` fixtures).
+
+    For truly hostile shared-`/tmp` environments, the safer answer
+    is a per-instance temp root (override via `TMPDIR`); this
+    helper is a best-effort backstop, not a substitute.
+
+    Returns the number of directories removed."""
+    temp_root = Path(tempfile.gettempdir())
+    if not temp_root.is_dir():
+        return 0
+
+    import time
+    now = time.time()
+    removed = 0
+    # Stream the directory listing rather than materialize the whole
+    # set up front — `/tmp` can hold many thousands of entries on a
+    # busy host, and we only ever look at one at a time. `iterdir()`
+    # returns a lazy generator, so an `OSError` from the underlying
+    # `scandir` can be raised either at construction OR mid-iteration
+    # (e.g., the temp dir is unmounted while we're walking it). Wrap
+    # the whole `for` so either path lands the helper on the same
+    # graceful "give up and report what we got" branch — startup must
+    # not crash because /tmp had a transient hiccup.
+    try:
+        for entry in temp_root.iterdir():
+            if not entry.name.startswith(_TEMP_DIR_PREFIX):
+                continue
+            # Skip files / symlinks — we only ever create directories with
+            # this prefix, so anything else under that name is foreign.
+            if entry.is_symlink() or not entry.is_dir():
+                continue
+            if min_age_seconds > 0:
+                newest = _newest_mtime_within(entry)
+                if newest is None:
+                    # Stat failed entirely — safer to skip than to delete
+                    # a directory we can't read; the next sweep can retry.
+                    continue
+                if (now - newest) < min_age_seconds:
+                    continue
+            try:
+                shutil.rmtree(entry, ignore_errors=False)
+                removed += 1
+            except FileNotFoundError:
+                # Race: another process / a concurrent startup removed the
+                # directory between `iterdir()` and the `rmtree`. Benign —
+                # the end state is what we wanted anyway, so DEBUG only.
+                log.debug("cleanup_stale_temp_dirs: %s vanished before removal", entry)
+            except OSError as e:
+                # A locked file on Windows or a permissions hiccup
+                # shouldn't crash startup; log at WARNING and move on so
+                # operators can see real failures (vs the benign race
+                # above) in the log.
+                log.warning("cleanup_stale_temp_dirs: could not remove %s: %s", entry, e)
+    except OSError as e:
+        # `iterdir()` / `scandir` failed either at construction or
+        # mid-iteration. Whatever we already removed stays counted;
+        # the next startup pass will retry.
+        log.debug("cleanup_stale_temp_dirs: listing %s failed: %s", temp_root, e)
+    if removed:
+        log.info("cleanup_stale_temp_dirs: removed %d orphaned dir(s) under %s",
+                 removed, temp_root)
+    return removed
+
+
+def _remove_path(p: Path) -> None:
+    """Remove `p` whether it is a file or a directory; no-op if absent.
+
+    Sloppak outputs can be either zip-form (file) or dir-form
+    (directory), so staging / backup paths next to them may need to
+    survive crossing between the two forms — e.g. a leftover
+    `<out>.sloppak.tmp` file from a killed zip-form convert getting
+    cleaned up before a fresh `as_dir=True` convert stages its own
+    directory at the same path. Using a single helper keeps the call
+    sites symmetric and prevents `NotADirectoryError` /
+    `IsADirectoryError` from a mismatched cleanup primitive."""
+    if p.is_symlink():
+        # Symlinks should never appear inside our staging paths, but if
+        # one does, drop the link itself rather than follow it.
+        p.unlink(missing_ok=True)
+        return
+    if p.is_dir():
+        shutil.rmtree(p, ignore_errors=True)
+    elif p.exists():
+        p.unlink(missing_ok=True)
+
+
 # ── PSARC → sloppak ───────────────────────────────────────────────────────────
 
 def convert_psarc_to_sloppak(
@@ -169,11 +357,27 @@ def convert_psarc_to_sloppak(
         if not song.arrangements:
             raise RuntimeError("no playable arrangements found in PSARC")
 
+        # Lift tone data (gear definitions + in-song tone changes) out of the
+        # unpacked PSARC once — PSARCs keep tones in the manifest JSON /
+        # arrangement XML, neither of which survives into the sloppak, so
+        # without this the converted sloppak loses all tones. Done in one
+        # pass (not per arrangement) to avoid re-scanning the extracted tree.
+        try:
+            tones_by_arr = extract_tones_for_song(
+                tmp_extract, [a.name for a in song.arrangements]
+            )
+        except Exception as e:
+            log.warning("tone extraction failed: %s", e, exc_info=True)
+            tones_by_arr = {}
+
         used_ids: set[str] = set()
         arr_manifest: list[dict] = []
         first = True
         for arr in song.arrangements:
             aid = _arrangement_id(arr.name, used_ids)
+            # Attach tones to the Arrangement so arrangement_to_wire owns the
+            # serialization (single source of truth for the wire schema).
+            arr.tones = tones_by_arr.get(arr.name)
             wire = arrangement_to_wire(arr)
             if first:
                 wire["beats"] = [
@@ -234,18 +438,79 @@ def convert_psarc_to_sloppak(
         )
 
         _progress(progress_cb, 0.85, "packing", "Writing output")
+        # Atomic write: build the output at a sibling `.tmp` path first,
+        # then move/rename onto `out_path`. Without this, a kill mid-write
+        # leaves a partial / truncated `.sloppak` (or worse, a half-deleted
+        # dir-form output) on disk; the host's library scan keys off the
+        # filename, so the broken file shows up as a "real" sloppak until
+        # the next successful re-conversion overwrites it.
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_out = out_path.with_name(out_path.name + ".tmp")
+        # Pre-clean stale `.tmp` from a previously-killed convert.
+        # `_remove_path` handles either form, so a zip-form `.tmp` left
+        # behind by an earlier `as_dir=False` crash doesn't block a new
+        # `as_dir=True` stage (or vice versa).
+        _remove_path(tmp_out)
         if as_dir:
+            shutil.copytree(work_dir, tmp_out)
+            # Directory rename-onto-existing isn't portable (`os.replace`
+            # raises on Windows when dst is a non-empty dir, and POSIX
+            # `rename(2)` only swaps empty dirs). Two-step swap via a
+            # `.old` sidecar so the failure window is bounded to one
+            # rename; on Windows the dst-exists case is still a brief
+            # absence rather than a partial dir.
+            backup = out_path.with_name(out_path.name + ".old")
+            # Backup slot may pre-exist as either file or dir — could
+            # be a leftover from a prior killed `as_dir=True` swap, or
+            # a stray file a user dropped there. Clear either form.
+            _remove_path(backup)
+            # `out_path` itself may pre-exist as either form (user
+            # reconverting `as_dir=True` over a previous zip-form
+            # sloppak, or vice versa). `rename` on a file works the
+            # same as on a dir, so no type sniff needed.
             if out_path.exists():
-                shutil.rmtree(out_path)
-            shutil.copytree(work_dir, out_path)
+                out_path.rename(backup)
+            try:
+                tmp_out.rename(out_path)
+            except Exception:
+                if backup.exists():
+                    backup.rename(out_path)
+                raise
+            # Backup may itself be either form (we just renamed
+            # whatever was at out_path into it); use the helper.
+            _remove_path(backup)
         else:
-            _zip_dir(work_dir, out_path)
+            _zip_dir(work_dir, tmp_out)
+            # `os.replace` can swap file-onto-file atomically, but
+            # cannot replace a non-empty directory with a file (POSIX
+            # `rename(2)` returns ENOTDIR/EISDIR; Windows fails the
+            # same way). If `out_path` is a dir-form sloppak left from
+            # a prior `as_dir=True` convert, clear it first. The brief
+            # absence window between rmtree and os.replace mirrors the
+            # dir→dir swap path's bounded gap; without this the convert
+            # would crash and the user would have to manually delete
+            # the dir to recover.
+            if out_path.is_dir():
+                _remove_path(out_path)
+            os.replace(tmp_out, out_path)
 
         _progress(progress_cb, 1.0, "done", f"Wrote {out_path.name}")
         return out_path
     finally:
         shutil.rmtree(tmp_extract, ignore_errors=True)
         shutil.rmtree(work_dir, ignore_errors=True)
+        # Clean up staging sidecars left behind if we bailed before the
+        # rename. The happy path already moved `.tmp` onto `out_path`
+        # and removed `.old`, so these are no-ops there. The `.old`
+        # leg matters specifically for kills after `out_path.rename(backup)`
+        # but before `tmp_out.rename(out_path)` in the `as_dir=True` path
+        # — without this, a stale `.old` dir accumulates next to the
+        # (re-created) `out_path` across crashes.
+        for sidecar in (
+            out_path.with_name(out_path.name + ".tmp"),
+            out_path.with_name(out_path.name + ".old"),
+        ):
+            _remove_path(sidecar)
 
 
 # ── Stem splitting via Demucs ────────────────────────────────────────────────
@@ -455,11 +720,7 @@ def _run_demucs(full_ogg: Path, out_dir: Path, model: str) -> Path:
 def _encode_ogg(wav_path: Path, ogg_path: Path) -> None:
     ffmpeg = _ffmpeg_cmd() or "ffmpeg"
     ogg_path.parent.mkdir(parents=True, exist_ok=True)
-    r = subprocess.run(
-        [ffmpeg, "-y", "-i", str(wav_path),
-         "-c:a", "libvorbis", "-q:a", "5", str(ogg_path)],
-        capture_output=True,
-    )
+    r = _ffmpeg_wav_to_ogg(ffmpeg, wav_path, ogg_path)
     if r.returncode != 0 or not ogg_path.exists():
         raise RuntimeError(
             f"ffmpeg OGG encode failed for {wav_path.name}: "

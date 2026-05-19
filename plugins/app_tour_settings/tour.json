@@ -1,0 +1,84 @@
+{
+    "version": 1,
+    "tour": [
+        {
+            "id": "welcome",
+            "title": "Settings tour",
+            "content": "Quick walk through the controls that matter most on first setup. You can re-run any time from the ? button.",
+            "shape": "bubble",
+            "position": "auto"
+        },
+        {
+            "id": "dlc-path",
+            "selector": "#dlc-path",
+            "title": "DLC folder",
+            "content": "Point Slopsmith at your Rocksmith 2014 DLC folder. PSARCs and sloppaks here become your library. Hit Save after changing.",
+            "shape": "spotlight",
+            "position": "bottom"
+        },
+        {
+            "id": "default-arrangement",
+            "selector": "#default-arrangement",
+            "title": "Default arrangement",
+            "content": "Which arrangement to land on when a song loads — Lead, Rhythm, Bass, or Auto (pick whatever the song has).",
+            "shape": "spotlight",
+            "position": "bottom"
+        },
+        {
+            "id": "av-offset",
+            "selector": "#setting-av-offset",
+            "title": "A/V sync offset",
+            "content": "Shift audio against the note highway in milliseconds. Use the note_detect plugin's auto-calibrate (or [ / ] keys in the player) to dial it in.",
+            "shape": "spotlight",
+            "position": "bottom"
+        },
+        {
+            "id": "rescan",
+            "selector": "#btn-rescan",
+            "title": "Rescan library",
+            "content": "Picks up new songs you've dropped into the DLC folder. Full Rescan rebuilds metadata from scratch — slower, only needed after upgrades or corruption.",
+            "shape": "spotlight",
+            "position": "bottom"
+        },
+        {
+            "id": "backup",
+            "selector": "#btn-export-settings",
+            "title": "Backup and restore",
+            "content": "Export bundles your core settings plus every plugin's opt-in state into a single file. Import on a fresh install to migrate. Plugin authors declare what gets included via settings.server_files.",
+            "shape": "spotlight",
+            "position": "bottom"
+        },
+        {
+            "id": "diagnostics",
+            "selector": "#btn-diag-export",
+            "title": "Export Diagnostics",
+            "content": "Builds a troubleshooting bundle (system info, logs, plugin diagnostics) for bug reports. Use the checkboxes above to control what's included; Redact strips paths and identifiers.",
+            "shape": "spotlight",
+            "position": "top"
+        },
+        {
+            "id": "plugins",
+            "selector": "#plugin-settings-area",
+            "title": "Per-plugin settings",
+            "content": "Every installed plugin with its own settings shows up here as a collapsible section. Plugin updates are surfaced at the top of this block.",
+            "shape": "spotlight",
+            "position": "top",
+            "waitFor": "#plugin-settings-area"
+        },
+        {
+            "id": "about",
+            "selector": "#app-version-about",
+            "title": "About",
+            "content": "Version, source code, and license. Slopsmith is AGPL-3.0 — if you fork it, the source has to stay open.",
+            "shape": "spotlight",
+            "position": "top"
+        },
+        {
+            "id": "outro",
+            "title": "Done",
+            "content": "Plugins ship their own tours too — the ? button surfaces whichever ones apply to the current screen.",
+            "shape": "bubble",
+            "position": "auto"
+        }
+    ]
+}

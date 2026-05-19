@@ -40,7 +40,7 @@ import yaml  # noqa: E402
 
 from patcher import unpack_psarc  # noqa: E402
 from song import load_song, arrangement_to_wire  # noqa: E402
-from audio import find_wem_files, _vgmstream_cmd, _ffmpeg_cmd  # noqa: E402
+from audio import find_wem_files, _vgmstream_cmd, _ffmpeg_cmd, _ffmpeg_wav_to_ogg  # noqa: E402
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -84,10 +84,9 @@ def _wem_to_ogg(wem_path: str, out_ogg: Path) -> None:
             )
 
         out_ogg.parent.mkdir(parents=True, exist_ok=True)
-        r2 = subprocess.run(
-            [ffmpeg, "-y", "-i", str(wav), "-c:a", "libvorbis", "-q:a", "5", str(out_ogg)],
-            capture_output=True,
-        )
+        # Shared helper handles the libvorbis → built-in vorbis fallback
+        # when the host ffmpeg was built without --enable-libvorbis.
+        r2 = _ffmpeg_wav_to_ogg(ffmpeg, wav, out_ogg)
         if r2.returncode != 0 or not out_ogg.exists() or out_ogg.stat().st_size < 100:
             raise RuntimeError(
                 f"ffmpeg OGG encode failed: {r2.stderr.decode(errors='replace')}"

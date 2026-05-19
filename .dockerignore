@@ -1,0 +1,62 @@
+*
+
+!.dockerignore
+!Dockerfile
+!dockerfile
+!requirements.txt
+!server.py
+!main.py
+!VERSION
+
+!lib/
+!lib/**
+
+# Mirror the static/* policy from .gitignore: ship the static tree, but not
+# the cached audio/art artifacts a developer's runtime would generate
+# (static/*.ogg, *.mp3, *.wav, art/, audio_*/). Those bloat the image and
+# make builds non-reproducible across machines.
+!static/
+!static/**
+static/*.ogg
+static/*.mp3
+static/*.wav
+static/art/
+static/audio_*/
+static/sloppak_cache/
+# note-detection tuning flow auto-writes WAVs and JSONL captures here.
+# Not in .gitignore yet — see docs/note-detect-tuning.md — but still a
+# generated-at-runtime directory that shouldn't bake into the image.
+static/note_detect_recordings/
+
+# Mirror the plugins/* policy from .gitignore: only `plugins/__init__.py`
+# and the in-tree core plugins ship in the image. Add new core plugins as
+# `!plugins/<id>/**` exceptions here when their .gitignore counterpart is
+# added (currently: highway_3d).
+!plugins/
+plugins/*/
+!plugins/__init__.py
+!plugins/highway_3d/
+!plugins/highway_3d/**
+
+!rscli/
+!rscli/**
+
+# Exclude common developer artifacts even inside the whitelisted trees so a
+# venv / cache / build output never gets baked into the image.
+**/__pycache__/
+**/*.pyc
+**/.pytest_cache/
+**/.mypy_cache/
+**/.ruff_cache/
+**/node_modules/
+**/.venv/
+**/venv/
+**/.env
+# .NET build artifacts — `rscli/` ships only the .fsproj + Program.fs
+# (the Dockerfile builder stage rebuilds from source). A contributor
+# with a local `dotnet build` would otherwise dump rscli/bin/, rscli/obj/
+# into the build context.
+**/bin/
+**/obj/
+**/.env.*
+**/.DS_Store

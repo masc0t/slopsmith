@@ -27,6 +27,7 @@ function createHighway() {
     let chartTime = 0;
     let currentTime = 0;
     let avOffsetSec = 0;
+    let songOffset = 0.0;  // per-song chart offset (loose-folder format only)
     // Monotonic getTime support: between setTime() calls, getTime()
     // interpolates forward using performance.now() so plugins observe a
     // smooth sub-frame clock instead of the coarse step-quantization
@@ -85,6 +86,7 @@ function createHighway() {
     let songInfo = {};
     let notes = [];
     let chords = [];
+    let handShapes = [];
     let beats = [];
     let sections = [];
     let anchors = [];
@@ -116,6 +118,16 @@ function createHighway() {
     let _filteredNotes = null;
     let _filteredChords = null;
     let _filteredAnchors = null;
+    let _filteredHandShapes = null;
+    // Tracks whether ANY phrase level carries handshape data. Lets us
+    // distinguish "this difficulty has none" (respect strictly — even
+    // when empty) from "the chart's phrase data never authored any
+    // handshapes at all" (fall back to the flat list so 3D arpeggio
+    // hints still work on DLC that ships handshapes only on the
+    // arrangement root). Without this flag the bundle would silently
+    // surface arp-frame hints at low-mastery levels that shouldn't
+    // have any.
+    let _phrasesHaveHandShapes = false;
     let showLyrics = localStorage.getItem('showLyrics') !== 'false';
     let _drawHooks = [];  // plugin draw callbacks: fn(ctx, W, H)
     // slopsmith#254 — per-note judgment overlay. A plugin (note_detect)
@@ -438,6 +450,15 @@ function createHighway() {
             // Master-difficulty (slopsmith#48)
             mastery: _mastery,
             hasPhraseData: !!(_phrases && _phrases.length > 0),
+            // When phrase data authored ANY handshape, respect the filtered
+            // list strictly (even when this difficulty leaves it empty) —
+            // otherwise low-mastery levels would surface arp hints that
+            // don't belong. Only fall back to the flat list when the
+            // phrase data carries no handshapes at all (common on DLC
+            // where handshapes ship on the arrangement root).
+            handShapes: (_filteredHandShapes !== null && _phrasesHaveHandShapes)
+                ? _filteredHandShapes
+                : handShapes,
 
             // Display flags
             inverted: _inverted,
@@ -1925,13 +1946,14 @@ function createHighway() {
     }
 
     // True if a chord note carries per-strum technique data (bend,
-    // hammer/pull/tap, slide, palm-mute, tremolo, accent, harmonic, pinch
-    // harmonic, dead note). drawNote renders these as glyph labels —
-    // alternate render paths (repeat box, open-string-in-chord wide bar)
+    // hammer/pull/tap, slide, palm-mute, vibrato, tremolo, accent, harmonic, pinch
+    // harmonic, dead note). drawNote shows these in 3D (`ac` accent is a brighter
+    // gem instead of a glyph there). Alternate render paths (repeat box,
+    // open-string-in-chord wide bar)
     // bypass drawNote and so must fall back to the full path whenever a
     // technique flag is present, otherwise authored cues vanish silently.
     function _noteHasTechniqueFlags(n) {
-        if (n.bn || n.ho || n.po || n.tp || n.pm || n.tr || n.ac || n.hm || n.hp || n.mt) return true;
+        if (n.bn || n.ho || n.po || n.tp || n.pm || n.vb || n.tr || n.ac || n.hm || n.hp || n.mt) return true;
         if (typeof n.sl === 'number' && n.sl >= 0) return true;
         return false;
     }
@@ -1965,7 +1987,7 @@ function createHighway() {
         // per-chord WeakMap entry. A chain breaks when the next chord has a
         // different id OR the time gap is >= CHAIN_GAP_THRESHOLD.
         // Chords that carry per-strum technique flags (bend / palm-mute /
-        // hammer / pull / tap / slide / tremolo / accent / harmonic / mute)
+        // hammer / pull / tap / slide / vibrato / tremolo / accent / harmonic / mute)
         // never collapse to a repeat box — those cues are authored on each
         // strum and must stay visible.
         let chainStart = 0;
@@ -2116,11 +2138,21 @@ function createHighway() {
             _filteredNotes = null;
             _filteredChords = null;
             _filteredAnchors = null;
+            _filteredHandShapes = null;
+            _phrasesHaveHandShapes = false;
             return;
         }
         const outNotes = [];
         const outChords = [];
         const outAnchors = [];
+        const outHandShapes = [];
+        // Scan EVERY level (not just the current mastery's slice): if
+        // any level anywhere authored a handshape, the chart's phrase
+        // data is the authoritative source and the bundle should
+        // respect filtered emptiness strictly. Otherwise, the chart
+        // didn't ship handshapes via phrases at all and we should fall
+        // back to the flat arrangement-root list (DLC pattern).
+        let anyHandShapeInPhrases = false;
         for (const p of _phrases) {
             const n = p.levels.length;
             if (n === 0) continue;
@@ -2137,10 +2169,24 @@ function createHighway() {
             // the highway panning into empty regions — filter them to
             // the same level as the notes they pair with.
             for (const x of lv.anchors) outAnchors.push(x);
+            for (const x of (lv.handshapes || [])) outHandShapes.push(x);
+            if (!anyHandShapeInPhrases) {
+                for (const level of p.levels) {
+                    if (level.handshapes && level.handshapes.length > 0) {
+                        anyHandShapeInPhrases = true;
+                        break;
+                    }
+                }
+            }
         }
         _filteredNotes = outNotes;
         _filteredChords = outChords;
         _filteredAnchors = outAnchors;
+        if (outHandShapes.length) {
+            outHandShapes.sort((a, b) => a.start_time - b.start_time);
+        }
+        _filteredHandShapes = outHandShapes;
+        _phrasesHaveHandShapes = anyHandShapeInPhrases;
     }
 
     // ── Public API ───────────────────────────────────────────────────────
@@ -2171,7 +2217,7 @@ function createHighway() {
             _resizeHandler = () => this.resize();
             window.addEventListener('resize', _resizeHandler);
             ready = false;
-            notes = []; chords = []; beats = []; sections = []; anchors = []; chordTemplates = []; lyrics = []; toneChanges = []; toneBase = "";
+            notes = []; chords = []; handShapes = []; beats = []; sections = []; anchors = []; chordTemplates = []; lyrics = []; toneChanges = []; toneBase = "";
             stringCount = 6;  // default until song_info arrives
             // Reset phrase ladder + filter (slopsmith#48). _mastery
             // persists across arrangement switches — the slider's
@@ -2182,6 +2228,8 @@ function createHighway() {
             _filteredNotes = null;
             _filteredChords = null;
             _filteredAnchors = null;
+            _filteredHandShapes = null;
+            _phrasesHaveHandShapes = false;
             _resetChordRenderState();
         },
 
@@ -2266,6 +2314,9 @@ function createHighway() {
             _wsGen += 1;
             // Fresh routing promise for this connection's song_info load.
             _juceRoutingPromise = Promise.resolve();
+            // Clear any stale "initial routing in-flight" flag from a prior
+            // connection so the app.js engine-reroute watcher isn't wedged.
+            window._highwayJuceRoutingPending = false;
             ws = new WebSocket(wsUrl);
             ws.onclose = () => { console.log('WS closed'); };
             ws.onerror = (e) => { console.error('WS error', e); };
@@ -2341,6 +2392,10 @@ function createHighway() {
                             break;
                         case 'song_info':
                             songInfo = msg;
+                            {
+                                const parsedOffset = Number(msg.offset);
+                                songOffset = Number.isFinite(parsedOffset) ? parsedOffset : 0.0;
+                            }
                             // Pick up the active arrangement's string count.
                             // Prefer the explicit `stringCount` field (added
                             // in slopsmith-plugin-3dhighway#7); fall back to
@@ -2414,14 +2469,20 @@ function createHighway() {
                                 if (msg.audio_url) {
                                     const audio = document.getElementById('audio');
                                     const audioFilename = msg.audio_url.split('/').pop();
+                                    // Only attempt JUCE routing for /audio/ URLs — sloppak stems
+                                    // (/api/sloppak/…) are not resolvable via audio-local-path.
+                                    const isAudioUrl = msg.audio_url.startsWith('/audio/');
+                                    // Record the loaded song's audio so app.js can re-route it
+                                    // between the HTML5 and JUCE paths if the audio engine is
+                                    // started/stopped after the song is already loaded. Set this
+                                    // unconditionally (not just on reload): when alreadyLoaded is
+                                    // true the watcher must still see correct, current metadata.
+                                    window._currentSongAudio = { url: msg.audio_url, juceEligible: isAudioUrl };
                                     const alreadyLoaded = window._juceMode
                                         ? window._juceAudioUrl === msg.audio_url
                                         : (audio.src && audio.src.includes(audioFilename));
                                     if (!alreadyLoaded) {
                                         const juceApi = window.slopsmithDesktop?.audio;
-                                        // Only attempt JUCE routing for /audio/ URLs — sloppak stems
-                                        // (/api/sloppak/…) are not resolvable via audio-local-path.
-                                        const isAudioUrl = msg.audio_url.startsWith('/audio/');
                                         if (isAudioUrl && juceApi) {
                                             // Run JUCE routing off the critical message-processing chain
                                             // so subsequent notes/chords/ready messages aren't blocked
@@ -2429,9 +2490,36 @@ function createHighway() {
                                             // awaits _juceRoutingPromise so _juceMode is settled before
                                             // _onReady / song:ready fire.
                                             const audioUrl = msg.audio_url;
+                                            // Flag the initial song-load JUCE routing as in-flight so the
+                                            // app.js engine-reroute watcher stands down until _juceMode is
+                                            // settled — otherwise its 350ms poll could race this routing
+                                            // and double-call loadBackingTrack for the same URL.
+                                            window._highwayJuceRoutingPending = true;
                                             _juceRoutingPromise = (async () => {
                                                 let pathLabel = '<missing>';
                                                 try {
+                                                    // Wait out any in-flight native-audio reconfiguration (e.g.
+                                                    // a NAM tone graph build that restarts the audio device)
+                                                    // before touching the JUCE backing engine — otherwise the
+                                                    // device restart races the backing-track load (and an
+                                                    // isAudioRunning() check landing mid-restart would skip
+                                                    // backing entirely). Raced against a local 3s timeout so a
+                                                    // plugin barrier that never settles cannot wedge song entry;
+                                                    // the try/catch + Promise.resolve wrapper also covers a
+                                                    // synchronous throw from the barrier call.
+                                                    if (typeof window.slopsmithAudioBarrier === 'function') {
+                                                        let barrierTimer;
+                                                        try {
+                                                            await Promise.race([
+                                                                Promise.resolve().then(() => window.slopsmithAudioBarrier()),
+                                                                new Promise((r) => { barrierTimer = setTimeout(r, 3000); }),
+                                                            ]);
+                                                        } catch (_) { /* barrier is best-effort */ }
+                                                        // Promise.race doesn't cancel the loser — clear the timer
+                                                        // when the barrier wins so rapid song switches don't leak.
+                                                        clearTimeout(barrierTimer);
+                                                        if (gen !== _wsGen) return; // navigated away during the wait
+                                                    }
                                                     if (await juceApi.isAudioRunning()) {
                                                         if (gen !== _wsGen) return; // stale
                                                         const res = await fetch(`/api/audio-local-path?url=${encodeURIComponent(audioUrl)}`);
@@ -2446,22 +2534,31 @@ function createHighway() {
                                                         if (gen !== _wsGen) return; // stale
                                                         window._juceMode = true;
                                                         window._juceAudioUrl = audioUrl;
-                                                        // Match native backing gain to the Song mixer / persisted volume
-                                                        // (default engine backing is ~0.7 linear; HTML path uses audio.volume).
-                                                        let songPct = window.slopsmith?.audio?.readSongVolume?.();
-                                                        if (!Number.isFinite(songPct)) {
-                                                            try {
-                                                                songPct = parseFloat(localStorage.getItem('volume'));
-                                                            } catch (_e) { songPct = NaN; }
-                                                        }
-                                                        if (!Number.isFinite(songPct)) songPct = 80;
-                                                        songPct = Math.min(100, Math.max(0, songPct));
-                                                        // Don't let setGain failures flip routing back to HTML5 —
-                                                        // the backing track already loaded successfully. Wrap in
-                                                        // its own try/catch and re-check generation after the
-                                                        // await so a reconnect mid-flight can't apply stale state.
+                                                        // Re-apply the active Song fader whenever a new backing
+                                                        // track is loaded so song-to-song switches keep the same
+                                                        // user-selected level instead of the engine default.
                                                         try {
-                                                            await juceApi.setGain('backing', songPct / 100);
+                                                            const apply = window.slopsmith?.audio?.applySongVolume;
+                                                            if (typeof apply === 'function') {
+                                                                await apply();
+                                                            } else {
+                                                                // audio-mixer.js registers applySongVolume but is
+                                                                // loaded after highway.js in index.html. In JUCE
+                                                                // mode the HTML5 <audio> element is cleared, so
+                                                                // there is no later `loadedmetadata` event to
+                                                                // correct an unset gain. Read the persisted volume
+                                                                // and call juceApi.setGain directly so the backing
+                                                                // gain matches the user-selected level even when
+                                                                // the mixer module hasn't registered yet.
+                                                                let storedPct = 80;
+                                                                try {
+                                                                    const s = parseFloat(localStorage.getItem('volume'));
+                                                                    if (Number.isFinite(s)) storedPct = Math.min(100, Math.max(0, s));
+                                                                } catch (_) { /* localStorage may be blocked */ }
+                                                                if (typeof juceApi.setGain === 'function') {
+                                                                    try { await juceApi.setGain('backing', storedPct / 100); } catch (_) { /* IPC unavailable */ }
+                                                                }
+                                                            }
                                                         } catch (gainErr) {
                                                             console.warn('[highway] JUCE setGain backing failed', gainErr);
                                                         }
@@ -2478,18 +2575,39 @@ function createHighway() {
                                                 }
                                                 // HTML5 fallback (isAudioRunning false, or JUCE error)
                                                 if (gen !== _wsGen) return; // stale
-                                                audio.src = audioUrl;
-                                                audio.load();
                                                 window._juceMode = false;
                                                 window._juceAudioUrl = null;
+                                                audio.src = audioUrl;
+                                                if (typeof window.slopsmith?.audio?.applySongVolume === 'function') {
+                                                    void window.slopsmith.audio.applySongVolume();
+                                                }
+                                                audio.load();
                                                 _showAudioBufferingOverlay(audio);
-                                            })();
+                                            })().finally(() => {
+                                                // Initial routing settled (success, fallback, or stale
+                                                // bail) — release the app.js engine-reroute watcher.
+                                                // Only clear if this is still the live connection: a
+                                                // stale finally from a previous song must not release
+                                                // the gate for a newer in-flight load (which has its
+                                                // own pending=true and will clear its own finally).
+                                                if (gen === _wsGen) {
+                                                    window._highwayJuceRoutingPending = false;
+                                                }
+                                            });
                                         } else {
-                                            // Non-JUCE path: sloppak stems, or no JUCE API present
-                                            audio.src = msg.audio_url;
-                                            audio.load();
+                                            // Non-JUCE path: sloppak stems, or no JUCE API present.
+                                            // This branch does NOT set/clear
+                                            // window._highwayJuceRoutingPending — that gate guards
+                                            // only the async JUCE-routing branch above. This path is
+                                            // synchronous and brief, so the app.js reroute watcher
+                                            // running concurrently here is harmless.
                                             window._juceMode = false;
                                             window._juceAudioUrl = null;
+                                            audio.src = msg.audio_url;
+                                            if (typeof window.slopsmith?.audio?.applySongVolume === 'function') {
+                                                void window.slopsmith.audio.applySongVolume();
+                                            }
+                                            audio.load();
                                             _showAudioBufferingOverlay(audio);
                                         }
                                     }
@@ -2545,6 +2663,7 @@ function createHighway() {
                         case 'tone_changes': toneChanges = msg.data; toneBase = msg.base || ""; break;
                         case 'notes': notes = notes.concat(msg.data); break;
                         case 'chords': chords = chords.concat(msg.data); break;
+                        case 'handshapes': handShapes = handShapes.concat(msg.data); break;
                         case 'phrases':
                             // Accumulate chunks but DON'T rebuild the filter
                             // until `ready` — rebuilding per chunk would
@@ -2556,8 +2675,12 @@ function createHighway() {
                             break;
                         case 'ready':
                             ready = true;
+                            if (handShapes.length) {
+                                handShapes.sort((a, b) => a.start_time - b.start_time);
+                            }
                             _rebuildMasteryFilter();
                             console.log(`Highway ready: ${notes.length} notes, ${chords.length} chords` +
+                                `, ${handShapes.length} handShapes` +
                                 (_phrases !== null ? `, ${_phrases.length} phrases (mastery ${Math.round(_mastery * 100)}%)` : ""));
                             // Wait for the off-chain JUCE routing (if any) to settle
                             // so _juceMode is correctly set before _onReady and song:ready fire.
@@ -2586,8 +2709,11 @@ function createHighway() {
         },
 
         setTime(t) {
-            chartTime = t;
-            currentTime = t + avOffsetSec;
+            // chartTime is what getTime() exposes to plugins — bake the
+            // per-song offset in here so plugins (scoring, note detect,
+            // etc.) see the same chart-aligned clock the renderer does.
+            chartTime = t + songOffset;
+            currentTime = chartTime + avOffsetSec;
             // Only re-anchor on a genuinely new audio time. Repeated
             // calls with the same `t` (audio.currentTime hasn't updated
             // yet) keep the anchor's perfNow fixed so interpolation
@@ -2672,8 +2798,12 @@ function createHighway() {
             if (elapsedMs > _CHART_MAX_INTERP_MS) return chartTime;
             // Scale by the observed playback rate so getTime stays
             // accurate across slowdowns / speedups (audio.playbackRate
-            // != 1 is a first-class slopsmith feature).
-            return _chartAnchorAudioT + (_chartObservedRate * elapsedMs) / 1000;
+            // != 1 is a first-class slopsmith feature). Add songOffset
+            // so interpolated chart time stays consistent with the
+            // chartTime that setTime() / the early-return branches
+            // expose — anchors are stored in raw audio time, so the
+            // offset is applied on the way out.
+            return _chartAnchorAudioT + (_chartObservedRate * elapsedMs) / 1000 + songOffset;
         },
         // Returns the slopsmith <audio> element so plugins don't have to
         // reach for `document.getElementById('audio')` directly. In JUCE
@@ -2788,8 +2918,12 @@ function createHighway() {
             // Close old WS but keep audio + animation running
             if (ws) { ws.close(); ws = null; }
             ready = false;
-            notes = []; chords = []; beats = []; sections = []; anchors = []; chordTemplates = []; lyrics = []; toneChanges = []; toneBase = "";
+            notes = []; chords = []; handShapes = []; beats = []; sections = []; anchors = []; chordTemplates = []; lyrics = []; toneChanges = []; toneBase = "";
             stringCount = 6;  // default until song_info arrives
+            // Drop any per-song offset from the previous load so setTime
+            // calls that fire before the next song_info arrives don't
+            // bias the clock with stale data.
+            songOffset = 0.0;
             // Reset phrase ladder + filter (slopsmith#48). _mastery
             // persists across arrangement switches — the slider's
             // position stays put. Filter rebuilds on the next `ready`
@@ -2799,6 +2933,8 @@ function createHighway() {
             _filteredNotes = null;
             _filteredChords = null;
             _filteredAnchors = null;
+            _filteredHandShapes = null;
+            _phrasesHaveHandShapes = false;
             _resetChordRenderState();
             const arrParam = arrangement !== undefined ? `?arrangement=${arrangement}` : '';
             // filename might already be encoded from data-play attribute
@@ -2811,6 +2947,7 @@ function createHighway() {
         stop() {
             if (animFrame) { cancelAnimationFrame(animFrame); animFrame = null; }
             if (ws) { ws.close(); ws = null; }
+            songOffset = 0.0;  // reset per-song offset so next song starts clean
             if (_resizeHandler) {
                 window.removeEventListener('resize', _resizeHandler);
                 _resizeHandler = null;

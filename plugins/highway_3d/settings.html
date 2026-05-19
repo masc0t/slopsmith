@@ -37,6 +37,35 @@
     </div>
 </div>
 
+<div role="group" aria-labelledby="h3d-fretboard-heading" class="mt-6">
+    <h3 id="h3d-fretboard-heading" class="text-sm font-medium text-gray-400 mb-2">3D Highway — Fretboard</h3>
+
+    <!-- Fret spacing -->
+    <div class="mt-3">
+        <label for="h3d-fret-spacing" class="text-xs font-medium text-gray-400 mb-1 block">Fret spacing</label>
+        <select id="h3d-fret-spacing"
+            onchange="window.h3dSetFretSpacing && window.h3dSetFretSpacing(this.value)"
+            class="w-full bg-dark-700 border border-gray-800 rounded-lg px-3 py-2 text-xs text-gray-300 outline-none">
+            <option value="uniform">Uniform (equal width per fret — Rocksmith style)</option>
+            <option value="logarithmic">Instrument (logarithmic — decreasing toward bridge)</option>
+        </select>
+        <p class="text-xs text-gray-500 mt-1">The page will reload when changed.</p>
+    </div>
+
+    <script>
+    (function () {
+        const sel = document.getElementById('h3d-fret-spacing');
+        if (sel) {
+            try {
+                sel.value = localStorage.getItem('highway_3d.fretSpacing') === 'logarithmic' ? 'logarithmic' : 'uniform';
+            } catch (_) {
+                sel.value = 'uniform';
+            }
+        }
+    })();
+    </script>
+</div>
+
 <div role="group" aria-labelledby="h3d-bg-heading" class="mt-6">
     <h3 id="h3d-bg-heading" class="text-sm font-medium text-gray-400 mb-2">3D Highway — Background</h3>
     <p class="text-xs text-gray-500 mb-3">
@@ -141,6 +170,54 @@
         or scale on-screen text. Changes apply immediately while
         playing — no reload required.
     </p>
+
+    <div class="mt-3">
+        <label for="h3d-camera-mode" class="text-xs font-medium text-gray-400 mb-1 block">Camera view</label>
+        <select id="h3d-camera-mode"
+            onchange="window.h3dBgSetCameraMode && window.h3dBgSetCameraMode(this.value)"
+            class="w-full bg-dark-700 border border-gray-800 rounded-lg px-3 py-2 text-xs text-gray-300 outline-none">
+            <option value="lookahead">Wide ahead (default)</option>
+            <option value="steady">Steady &amp; close-in</option>
+        </select>
+        <p class="text-[10px] text-gray-500 mt-1">
+            <em>Wide ahead</em> shows more of the neck coming up and eases the framing forward.
+            <em>Steady &amp; close-in</em> keeps a calmer view centred on the notes right in front of you.
+        </p>
+    </div>
+
+    <div role="group" aria-labelledby="h3d-fret-look-heading" class="mt-5">
+        <h3 id="h3d-fret-look-heading" class="text-sm font-medium text-gray-400 mb-2">3D Highway — Nut &amp; headstock</h3>
+        <p class="text-xs text-gray-500 mb-3">
+            The 3D neck shows a nut, headstock, and a pitch label per string (from the chart tuning).
+            Turn pieces off or pick colors to match your taste.
+        </p>
+        <div class="flex flex-col gap-3 mt-2">
+            <label class="flex items-start gap-2 text-sm text-gray-300 cursor-pointer">
+                <input type="checkbox" id="h3d-nut-headstock-visible" checked class="mt-1 accent-accent"
+                    onchange="window.h3dBgSetNutHeadstockVisible && window.h3dBgSetNutHeadstockVisible(this.checked)">
+                <span>Show nut &amp; headstock</span>
+            </label>
+            <label class="flex items-start gap-2 text-sm text-gray-300 cursor-pointer">
+                <input type="checkbox" id="h3d-tuning-labels-visible" checked class="mt-1 accent-accent"
+                    onchange="window.h3dBgSetTuningLabelsVisible && window.h3dBgSetTuningLabelsVisible(this.checked)">
+                <span>Show open-string note name per string</span>
+            </label>
+            <div class="grid grid-cols-1 sm:grid-cols-2 gap-3 mt-1">
+                <div>
+                    <label for="h3d-nut-color" class="text-xs font-medium text-gray-400 mb-1 block">Nut color</label>
+                    <input type="color" id="h3d-nut-color" value="#f5f3f0"
+                        onchange="window.h3dBgSetNutColor && window.h3dBgSetNutColor(this.value)"
+                        class="h-9 w-full max-w-[12rem] cursor-pointer rounded border border-gray-800 bg-dark-700 p-0.5">
+                </div>
+                <div>
+                    <label for="h3d-headstock-color" class="text-xs font-medium text-gray-400 mb-1 block">Headstock color</label>
+                    <input type="color" id="h3d-headstock-color" value="#d4b48a"
+                        onchange="window.h3dBgSetHeadstockColor && window.h3dBgSetHeadstockColor(this.value)"
+                        class="h-9 w-full max-w-[12rem] cursor-pointer rounded border border-gray-800 bg-dark-700 p-0.5">
+                </div>
+            </div>
+        </div>
+    </div>
 
     <details class="mt-4 rounded-lg border border-gray-800 bg-dark-700/40">
         <summary class="cursor-pointer select-none px-3 py-2 text-xs font-medium text-gray-400 hover:text-gray-200">
@@ -324,14 +401,32 @@
         Per-note display options.
     </p>
 
-    <!-- Show fret number on note body (#12) -->
-    <div class="flex items-center gap-3 mt-3">
+    <!-- Fret digits on board ghost (#12) — not on flying notes -->
+    <div class="mt-3 space-y-2">
         <label class="flex items-center gap-2 text-sm text-gray-300">
-            <input type="checkbox" id="h3d-show-fret-on-note"
-                   onchange="window.h3dBgSetShowFretOnNote && window.h3dBgSetShowFretOnNote(this.checked)"
+            <input type="checkbox" id="h3d-show-fret-on-note" checked
                    class="accent-accent">
-            Show fret numbers on notes
+            Show fret numbers on fretboard ghost
         </label>
+        <p class="text-[10px] text-gray-500 ml-6">
+            Numbers appear on the hollow preview on the fretboard only (not on gems coming down the highway).
+        </p>
+        <div id="h3d-fret-ghost-scope-wrap" class="ml-6 mt-2 space-y-2 border-l border-gray-700 pl-3">
+            <p class="text-xs font-medium text-gray-400">Where to show</p>
+            <label class="flex items-center gap-2 text-sm text-gray-300 cursor-pointer">
+                <input type="radio" name="h3d-fret-ghost-scope" id="h3d-fret-ghost-scope-rocksmith" value="rocksmith"
+                       class="accent-accent">
+                In chords &amp; arpeggios (Rocksmith style)
+            </label>
+            <label class="flex items-center gap-2 text-sm text-gray-300 cursor-pointer">
+                <input type="radio" name="h3d-fret-ghost-scope" id="h3d-fret-ghost-scope-all" value="all"
+                       class="accent-accent">
+                All notes
+            </label>
+            <p class="text-[10px] text-gray-500">
+                Rocksmith style uses chord-hand events only. Single-note lines (including arpeggios charted as separate notes) need <em>All notes</em>.
+            </p>
+        </div>
     </div>
 </div>
 
@@ -438,7 +533,7 @@
         <label for="h3d-fret-column-marker-cadence" class="text-xs font-medium text-gray-400 mb-1 block">
             Fret-column marker cadence (measures)
         </label>
-        <input type="number" id="h3d-fret-column-marker-cadence" min="0" max="16" step="1" value="2"
+        <input type="number" id="h3d-fret-column-marker-cadence" min="0" max="16" step="1" value="1"
             onchange="window.h3dBgSetFretColumnMarkerCadence && window.h3dBgSetFretColumnMarkerCadence(this.value)"
             class="w-24 bg-dark-700 border border-gray-800 rounded-lg px-3 py-2 text-xs text-gray-300 outline-none">
         <p class="text-[10px] text-gray-500 mt-1">
@@ -496,14 +591,16 @@
          no-selection / NaN state. -->
     <script>
         (function () {
-            const DEFAULTS = { style: 'particles', intensity: 0.5, reactive: true, palette: 'default', showFretOnNote: false, cameraSmoothing: 0.5, zoomSmoothing: 0.5, tiltSmoothing: 0.5, cameraLockLow: false, cameraLockZoom: 0.5, textSize: 0.5, vibrancy: 0.85, glow: 0.25, customImageDataUrl: '', customImageName: '', customVideoName: '', chordDiagramSize: 0.5, chordDiagramPosition: 'tl', fretColumnMarkerCadence: 2, inlayLabelsVisible: false, sectionLabelsOnHighway: false, sectionHudVisible: true, sectionHudPosition: 'tr', sectionHudSize: 0.5, projectionVisible: true };
+            const DEFAULTS = { style: 'particles', intensity: 0.5, reactive: true, palette: 'default', showFretOnNote: true, fretNumberGhostScope: 'rocksmith', cameraSmoothing: 0.5, zoomSmoothing: 0.5, tiltSmoothing: 0.5, cameraLockLow: false, cameraLockZoom: 0.5, cameraMode: 'lookahead', nutHeadstockVisible: true, tuningLabelsVisible: true, nutColor: '#f5f3f0', headstockColor: '#d4b48a', textSize: 0.5, vibrancy: 0.85, glow: 0.25, customImageDataUrl: '', customImageName: '', customVideoName: '', chordDiagramSize: 0.5, chordDiagramPosition: 'tl', fretColumnMarkerCadence: 1, projectionVisible: true, inlayLabelsVisible: false, sectionLabelsOnHighway: false, sectionHudVisible: true, sectionHudPosition: 'tr', sectionHudSize: 0.5 };
             const VALID_STYLES = new Set(['off', 'particles', 'silhouettes', 'lights', 'geometric', 'image', 'video']);
             const VALID_PALETTES = new Set(['default', 'neon', 'pastel']);
+            const VALID_CAMERA_MODES = new Set(['steady', 'lookahead']);
             const VALID_CHORD_DIAG_POSITIONS = new Set(['tl', 'tr', 'bl', 'br']);
             // Section HUD shares the same four-corner anchor set as the
             // chord diagram (the renderer enforces the same id list via
             // CHORD_DIAG_POSITION_IDS), so reuse the validator here.
             const VALID_SECTION_HUD_POSITIONS = VALID_CHORD_DIAG_POSITIONS;
+            const VALID_FRET_GHOST_SCOPES = new Set(['rocksmith', 'all']);
             // Custom images are persisted as base64 data URLs in
             // localStorage. base64 expands the byte count by ~4/3, and
             // localStorage values are stored as UTF-16 (two bytes per
@@ -556,6 +653,10 @@
 
             function coerceStyle(v) { return VALID_STYLES.has(v) ? v : DEFAULTS.style; }
             function coercePalette(v) { return VALID_PALETTES.has(v) ? v : DEFAULTS.palette; }
+            function coerceCameraMode(v) {
+                if (v === 'classic') v = 'steady';
+                return VALID_CAMERA_MODES.has(v) ? v : DEFAULTS.cameraMode;
+            }
             function coerceIntensity(v) {
                 const n = parseFloat(v);
                 if (!Number.isFinite(n)) return DEFAULTS.intensity;
@@ -577,14 +678,25 @@
                 if (v === 'false' || v === '0') return false;
                 return fallback;
             }
+            function coerceFretGhostScope(v, fallback) {
+                if (v === null || v === undefined) return fallback;
+                return VALID_FRET_GHOST_SCOPES.has(String(v)) ? String(v) : fallback;
+            }
             function coerceCadence(v) {
                 const n = parseInt(v, 10);
                 if (!Number.isFinite(n)) return DEFAULTS.fretColumnMarkerCadence;
                 return Math.max(0, Math.min(16, n));
             }
+            function coerceHex6(v, fallback) {
+                if (typeof v !== 'string') return fallback;
+                const t = v.trim();
+                if (/^#[0-9a-fA-F]{6}$/.test(t)) return t.toLowerCase();
+                return fallback;
+            }
 
-            let storedStyle = null, storedI = null, storedR = null, storedPalette = null, storedFretOnNote = null;
+            let storedStyle = null, storedI = null, storedR = null, storedPalette = null, storedFretOnNote = null, storedFretNumberGhostScope = null;
             let storedCameraSmoothing = null;
+            let storedCameraMode = null;
             let storedCustomImageDataUrl = null, storedCustomImageName = null;
             let storedCustomVideoName = null;
             let storedZoomSmoothing = null;
@@ -602,6 +714,10 @@
             let storedSectionHudVisible = null;
             let storedSectionHudPosition = null;
             let storedSectionHudSize = null;
+            let storedNutHeadstockVisible = null;
+            let storedTuningLabelsVisible = null;
+            let storedNutColor = null;
+            let storedHeadstockColor = null;
             let storedProjectionVisible = null;
             try {
                 storedStyle = localStorage.getItem('h3d_bg_style');
@@ -609,7 +725,9 @@
                 storedR = localStorage.getItem('h3d_bg_reactive');
                 storedPalette = localStorage.getItem('h3d_bg_palette');
                 storedFretOnNote = localStorage.getItem('h3d_bg_showFretOnNote');
+                storedFretNumberGhostScope = localStorage.getItem('h3d_bg_fretNumberGhostScope');
                 storedCameraSmoothing = localStorage.getItem('h3d_bg_cameraSmoothing');
+                storedCameraMode = localStorage.getItem('h3d_bg_cameraMode');
                 storedZoomSmoothing = localStorage.getItem('h3d_bg_zoomSmoothing');
                 storedTiltSmoothing = localStorage.getItem('h3d_bg_tiltSmoothing');
                 storedCameraLockLow = localStorage.getItem('h3d_bg_cameraLockLow');
@@ -625,6 +743,10 @@
                 storedSectionHudVisible = localStorage.getItem('h3d_bg_sectionHudVisible');
                 storedSectionHudPosition = localStorage.getItem('h3d_bg_sectionHudPosition');
                 storedSectionHudSize = localStorage.getItem('h3d_bg_sectionHudSize');
+                storedNutHeadstockVisible = localStorage.getItem('h3d_bg_nutHeadstockVisible');
+                storedTuningLabelsVisible = localStorage.getItem('h3d_bg_tuningLabelsVisible');
+                storedNutColor = localStorage.getItem('h3d_bg_nutColor');
+                storedHeadstockColor = localStorage.getItem('h3d_bg_headstockColor');
                 storedProjectionVisible = localStorage.getItem('h3d_bg_projectionVisible');
                 storedCustomImageDataUrl = localStorage.getItem('h3d_bg_customImageDataUrl');
                 storedCustomImageName = localStorage.getItem('h3d_bg_customImageName');
@@ -636,6 +758,7 @@
             const reactive = coerceBool(storedR, DEFAULTS.reactive);
             const palette = coercePalette(storedPalette);
             const showFretOnNote = coerceBool(storedFretOnNote, DEFAULTS.showFretOnNote);
+            const fretNumberGhostScope = coerceFretGhostScope(storedFretNumberGhostScope, DEFAULTS.fretNumberGhostScope);
             const cameraSmoothing = coerceUnitInterval(storedCameraSmoothing, DEFAULTS.cameraSmoothing);
             // zoom + tilt smoothing mirror cameraSmoothing on first read so
             // existing users carry their calmness over to the new axes.
@@ -651,6 +774,7 @@
             const cameraLockZoom = (storedCameraLockZoom == null)
                 ? DEFAULTS.cameraLockZoom
                 : coerceUnitInterval(storedCameraLockZoom, DEFAULTS.cameraLockZoom);
+            const cameraMode = coerceCameraMode(storedCameraMode);
             const textSize = (storedTextSize == null)
                 ? DEFAULTS.textSize
                 : coerceUnitInterval(storedTextSize, DEFAULTS.textSize);
@@ -678,6 +802,10 @@
             const sectionHudSize = (storedSectionHudSize == null)
                 ? DEFAULTS.sectionHudSize
                 : coerceUnitInterval(storedSectionHudSize, DEFAULTS.sectionHudSize);
+            const nutHeadstockVisible = coerceBool(storedNutHeadstockVisible, DEFAULTS.nutHeadstockVisible);
+            const tuningLabelsVisible = coerceBool(storedTuningLabelsVisible, DEFAULTS.tuningLabelsVisible);
+            const nutColor = coerceHex6(storedNutColor, DEFAULTS.nutColor);
+            const headstockColor = coerceHex6(storedHeadstockColor, DEFAULTS.headstockColor);
             const projectionVisible = coerceBool(storedProjectionVisible, DEFAULTS.projectionVisible);
             const customImageDataUrl = (typeof storedCustomImageDataUrl === 'string') ? storedCustomImageDataUrl : DEFAULTS.customImageDataUrl;
             const customImageName    = (typeof storedCustomImageName === 'string')    ? storedCustomImageName    : DEFAULTS.customImageName;
@@ -696,6 +824,7 @@
             const tsli = document.getElementById('h3d-tilt-smoothing');
             const tlbl = document.getElementById('h3d-tilt-smoothing-label');
             const cll  = document.getElementById('h3d-camera-lock-low');
+            const cmod = document.getElementById('h3d-camera-mode');
             const lzli = document.getElementById('h3d-camera-lock-zoom');
             const lzlbl = document.getElementById('h3d-camera-lock-zoom-label');
             const tsi  = document.getElementById('h3d-text-size');
@@ -714,6 +843,10 @@
             const shpos = document.getElementById('h3d-section-hud-position');
             const shsi  = document.getElementById('h3d-section-hud-size');
             const shslbl= document.getElementById('h3d-section-hud-size-label');
+            const nhv   = document.getElementById('h3d-nut-headstock-visible');
+            const tlv   = document.getElementById('h3d-tuning-labels-visible');
+            const nco   = document.getElementById('h3d-nut-color');
+            const hco   = document.getElementById('h3d-headstock-color');
             const pgh   = document.getElementById('h3d-projection-visible');
             const fileInput = document.getElementById('h3d-bg-custom-image-file');
             const clearBtn  = document.getElementById('h3d-bg-custom-image-clear');
@@ -728,6 +861,30 @@
             if (pal) pal.value = palette;
             if (rea) rea.checked = reactive;
             if (fon) fon.checked = showFretOnNote;
+            const fgsRock = document.getElementById('h3d-fret-ghost-scope-rocksmith');
+            const fgsAll = document.getElementById('h3d-fret-ghost-scope-all');
+            const fgsWrap = document.getElementById('h3d-fret-ghost-scope-wrap');
+            if (fretNumberGhostScope === 'all') { if (fgsAll) fgsAll.checked = true; }
+            else { if (fgsRock) fgsRock.checked = true; }
+            if (fgsWrap) fgsWrap.classList.toggle('hidden', !showFretOnNote);
+
+            function syncH3dFretGhostScopeUi() {
+                const c = document.getElementById('h3d-show-fret-on-note');
+                const w = document.getElementById('h3d-fret-ghost-scope-wrap');
+                if (w && c) w.classList.toggle('hidden', !c.checked);
+            }
+            if (fon) {
+                fon.addEventListener('change', function () {
+                    if (window.h3dBgSetShowFretOnNote) window.h3dBgSetShowFretOnNote(this.checked);
+                    syncH3dFretGhostScopeUi();
+                });
+            }
+            document.querySelectorAll('input[name="h3d-fret-ghost-scope"]').forEach(function (r) {
+                r.addEventListener('change', function () {
+                    if (this.checked && window.h3dBgSetFretNumberGhostScope)
+                        window.h3dBgSetFretNumberGhostScope(this.value);
+                });
+            });
             if (csli) csli.value = String(cameraSmoothing);
             if (clbl) clbl.textContent = cameraSmoothing.toFixed(2);
             if (zsli) zsli.value = String(zoomSmoothing);
@@ -735,6 +892,11 @@
             if (tsli) tsli.value = String(tiltSmoothing);
             if (tlbl) tlbl.textContent = tiltSmoothing.toFixed(2);
             if (cll)  cll.checked  = cameraLockLow;
+            if (cmod) cmod.value   = cameraMode;
+            if (nhv)  nhv.checked  = nutHeadstockVisible;
+            if (tlv)  tlv.checked  = tuningLabelsVisible;
+            if (nco)  nco.value    = nutColor;
+            if (hco)  hco.value    = headstockColor;
             if (lzli) lzli.value = String(cameraLockZoom);
             if (lzlbl) lzlbl.textContent = cameraLockZoom.toFixed(2);
             if (tsi)  tsi.value  = String(textSize);

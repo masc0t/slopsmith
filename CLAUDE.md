@@ -29,7 +29,7 @@ tests/
 
 ## Plugin System
 
-Plugins are the primary extension point. Each plugin lives in `plugins/<name>/` with a `plugin.json` manifest:
+Plugins are the primary extension point. Each plugin lives in `plugins/<name>/` with a `plugin.json` manifest. Plugins are typically their own git repositories — see [CONTRIBUTING.md](CONTRIBUTING.md) for the licensing policy (curated plugins should be AGPL-3.0 or AGPL-compatible: MIT, BSD, Apache-2.0).
 
 ```json
 {
@@ -483,10 +483,24 @@ pytest -k "round_trip" -v      # Pattern match
 - CI: GitHub Actions runs pytest on push/PR to main (Python 3.12)
 - Test dependencies: `requirements-test.txt`
 
+## Tuning the note_detect plugin
+
+Detection quality is hard to judge by eye — a player UI that "feels worse" after a code change isn't a regression you can defend in review. The plugin ships with a record-replay-sweep workflow so changes to the detector, the matcher, or the user's environment (A/V offset, latency, channel) can be measured against a single reference take.
+
+Quick orientation:
+- **Reference recording** lives in the gear popover on the player (gated behind Settings → Note Detection → "Detection tuning (advanced)"). Arm before pressing Play; auto-saves a WAV to `static/note_detect_recordings/` on song-end. The directory is bind-mounted, so the host-side harness can read it without a copy step.
+- **Benchmark sloppak** ships in-tree at [docs/benchmarks/note_detect_v1/note_detect_benchmark_v1.sloppak](docs/benchmarks/note_detect_v1/note_detect_benchmark_v1.sloppak) — 8 sections each isolating a different failure mode (low-freq mono, sustained holds, hammer/pull, power chords, dense open chords, bends). Drop it directly into your sloppak DLC folder to install (don't rename — slopsmith keys off the `.sloppak` suffix even though the file is a zip under the hood). The unzipped form lands at `static/sloppak_cache/note_detect_benchmark_v1.sloppak/` after first play. Builder: [docs/benchmarks/note_detect_v1/build_benchmark.py](docs/benchmarks/note_detect_v1/build_benchmark.py).
+- **Headless harness** at [`tools/harness.js`](https://github.com/byrongamatos/slopsmith-plugin-notedetect/blob/main/tools/harness.js) in the note_detect plugin's own repo (cloned into `plugins/note_detect/` locally) runs the same `processFrame` / `matchNotes` / `checkMisses` code path off Node, in seconds per run. Same `note_detect.diagnostic.v1` schema as the in-app Download Diagnostic button.
+- **A/V auto-calibrate** (Settings → Note Detection) reads `timing_error_ms_hits.median` and proposes the av-offset that drives it to zero. Iterative: usually converges in 2–3 Apply rounds.
+
+**Always record at 1.0× playback speed** — half-speed takes produce all-miss garbage because chart times are absolute. **Always use `timing_error_ms_hits` (not all-matched) as a calibration signal** — the all-matched median pins near a constant when the offset is wrong, because the matcher silently snaps to neighbouring chart notes.
+
+Full developer reference (workflow recipes, harness flag table, diagnostic schema, common pitfalls): [docs/note-detect-tuning.md](docs/note-detect-tuning.md).
+
 ## Versioning
 
 - **`VERSION`** (repo root) — single source of truth; plain semver string (e.g. `0.2.4`). Bind-mounted into the container and copied by the Dockerfile so it's always available at `/app/VERSION`.
-- **`GET /api/version`** — returns `{"version": "<contents of VERSION>"}`. Displayed as a badge in the navbar.
+- **`GET /api/version`** — returns `{"version": "<contents of VERSION>", "source_url": "...", "license_url": "..."}`. The version drives the navbar badge; `source_url` / `license_url` populate the Settings → About links. `source_url` is configurable via the `APP_SOURCE_URL` env var (default `https://github.com/byrongamatos/slopsmith`); `license_url` falls back to `source_url + "/blob/main/LICENSE"` (GitHub-style, default branch `main`) and is overridable via the `APP_LICENSE_URL` env var — set it explicitly when the source is hosted on a non-GitHub forge (GitLab/Gitea/self-hosted) or under a non-`main` default branch. Both env values must be `http(s)`; non-http(s) values are rejected and fall back to the safe default to prevent `javascript:`/`data:` hrefs.
 - **Auto-sync** — `.github/workflows/sync-version.yml` rewrites `VERSION` via a `repository_dispatch` (`desktop-released`) fired from `slopsmith-desktop`'s release job. As an explicit automation-only exception to the "Never push directly to main" rule in Git Workflow below, the sync job commits straight to `main` as `github-actions[bot]` (version bumps are mechanical; the PR round-trip adds no signal). Human contributors must still go through feature branches + PRs. No manual VERSION edits needed. Use the workflow's `workflow_dispatch` trigger with `version: X.Y.Z` for manual runs (recovery / out-of-band bumps).
 - **`CHANGELOG.md`** — follows [Keep a Changelog](https://keepachangelog.com/) format. Update the `[Unreleased]` section with each PR; when `slopsmith-desktop` cuts a release, rename `[Unreleased]` to the new version + date (the VERSION bump itself is automated).
 

@@ -14,7 +14,33 @@ import json
 import sys
 
 import pytest
-from fastapi.testclient import TestClient
+
+
+class _DirectResponse:
+    def __init__(self, payload, status_code=200):
+        self._payload = payload
+        self.status_code = status_code
+
+    def json(self):
+        return self._payload
+
+
+class _DirectSettingsClient:
+    def __init__(self, server):
+        self._server = server
+
+    def get(self, path):
+        if path != "/api/settings":
+            raise ValueError(f"unsupported path: {path}")
+        return _DirectResponse(self._server.get_settings())
+
+    def post(self, path, json):
+        if path != "/api/settings":
+            raise ValueError(f"unsupported path: {path}")
+        return _DirectResponse(self._server.save_settings(json))
+
+    def close(self):
+        pass
 
 
 @pytest.fixture()
@@ -29,16 +55,20 @@ def client(tmp_path, monkeypatch):
     # Forcing a fresh import inside the patched env means each test
     # gets an isolated meta_db + config dir.
     monkeypatch.setenv("CONFIG_DIR", str(tmp_path))
+    monkeypatch.setenv("SLOPSMITH_SKIP_STARTUP_TASKS", "1")
     sys.modules.pop("server", None)
     server = importlib.import_module("server")
-    test_client = TestClient(server.app)
+    test_client = _DirectSettingsClient(server)
     try:
         yield test_client
     finally:
-        # Close both the HTTP client and the sqlite connection meta_db
-        # opened at import. Without this teardown each test would leak
-        # a file handle; pytest's per-test tmp_path cleanup can also
-        # fail on Windows when the sqlite handle is still open.
+        # This fixture drives settings handlers directly (no FastAPI/HTTP
+        # layer), so there's nothing to close on the client side — the
+        # `close()` is just a stub kept for symmetry. What we *do* need
+        # to release is the sqlite connection meta_db opened at import:
+        # without this teardown each test leaks a file handle and
+        # pytest's per-test tmp_path cleanup can fail on Windows while
+        # that handle is still open.
         test_client.close()
         meta_db = getattr(server, "meta_db", None)
         conn = getattr(meta_db, "conn", None)
@@ -532,3 +562,215 @@ def test_is_first_scan_false_when_some_songs_cached(tmp_path, scan_module):
         scan_module._background_scan()
 
     assert captured_status.get("is_first_scan") is False
+
+
+# ── TestClient lifespan coverage ─────────────────────────────────────────────
+#
+# The rest of this module drives settings handlers directly to keep tests fast
+# and side-effect-free, but that bypass means the FastAPI route registration,
+# request parsing, and lifespan/startup wiring would never get exercised. The
+# tests below restore that coverage by going through a real `TestClient`, with
+# `SLOPSMITH_SKIP_STARTUP_TASKS=1` so plugin loading and the background scan
+# don't reach for the user's filesystem.
+
+def _snapshot_loaded_plugins():
+    """Snapshot `plugins.LOADED_PLUGINS` so a test that triggers the
+    skip-startup branch (which clears the registry) can restore it on
+    teardown — otherwise the cleared state leaks to later tests that
+    expect it to look as the importer left it."""
+    import plugins as plugins_mod
+    with plugins_mod.PLUGINS_LOCK:
+        return list(plugins_mod.LOADED_PLUGINS)
+
+
+def _restore_loaded_plugins(snapshot):
+    import plugins as plugins_mod
+    with plugins_mod.PLUGINS_LOCK:
+        plugins_mod.LOADED_PLUGINS.clear()
+        plugins_mod.LOADED_PLUGINS.extend(snapshot)
+
+
+@pytest.fixture()
+def api_client(tmp_path, monkeypatch, isolate_logging):
+    """A real FastAPI TestClient against a fresh server import.
+
+    Using `TestClient` as a context manager runs the lifespan/startup hook,
+    which is the only place the skip-tasks branch is actually exercised.
+
+    Pulls in `isolate_logging` from tests/conftest.py — the startup hook
+    calls `configure_logging()`, which mutates global slopsmith/uvicorn
+    handlers and structlog defaults; without snapshot/restore those
+    changes leak into later tests and the suite becomes order-dependent."""
+    from fastapi.testclient import TestClient
+
+    monkeypatch.setenv("CONFIG_DIR", str(tmp_path))
+    monkeypatch.setenv("SLOPSMITH_SKIP_STARTUP_TASKS", "1")
+    sys.modules.pop("server", None)
+    plugins_snapshot = _snapshot_loaded_plugins()
+    server = importlib.import_module("server")
+    try:
+        with TestClient(server.app) as tc:
+            yield tc, server
+    finally:
+        conn = getattr(getattr(server, "meta_db", None), "conn", None)
+        if conn is not None:
+            conn.close()
+        _restore_loaded_plugins(plugins_snapshot)
+
+
+def test_api_get_settings_via_testclient(api_client, tmp_path):
+    """End-to-end smoke through the real /api/settings GET route."""
+    tc, _server = api_client
+    r = tc.get("/api/settings")
+    assert r.status_code == 200
+    assert isinstance(r.json(), dict)
+
+
+def test_api_post_settings_via_testclient(api_client, tmp_path):
+    """End-to-end smoke through the real /api/settings POST route."""
+    tc, _server = api_client
+    r = tc.post("/api/settings", json={"master_difficulty": 73})
+    assert r.status_code == 200
+    assert _read_cfg(tmp_path)["master_difficulty"] == 73
+
+
+# Validation/rejection cases that the direct-call fixture covers
+# extensively, but that we also want to pin at the route level — that's
+# the only layer FastAPI request parsing / response serialization runs
+# at, so an API-contract regression (e.g. a Pydantic model change that
+# subtly alters how null or non-numeric values are handled) could pass
+# the direct-call tests while breaking the real /api/settings clients.
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"master_difficulty": "abc"},
+        {"master_difficulty": "1e309"},  # overflow past int range
+        {"dlc_dir": 42},                  # non-string for path field
+        {"psarc_platform": "windows"},    # invalid enum value
+    ],
+)
+def test_api_post_settings_invalid_values_via_testclient(api_client, payload):
+    """POSTing invalid values through the real route still returns 200
+    with an `error` field (handler returns a dict rather than raising
+    HTTPException), and doesn't 500 on the wire."""
+    tc, _server = api_client
+    r = tc.post("/api/settings", json=payload)
+    assert r.status_code == 200
+    body = r.json()
+    assert "error" in body, body
+
+
+def test_api_post_settings_null_string_is_noop_via_testclient(api_client, tmp_path):
+    """null for a string-shaped key is a no-op at the API layer — the
+    handler must merge the request without clearing the on-disk value."""
+    (tmp_path / "config.json").write_text(json.dumps({"dlc_dir": "/existing/path"}))
+    tc, _server = api_client
+    r = tc.post("/api/settings", json={"dlc_dir": None, "master_difficulty": 50})
+    assert r.status_code == 200
+    assert _read_cfg(tmp_path)["dlc_dir"] == "/existing/path"
+    assert _read_cfg(tmp_path)["master_difficulty"] == 50
+
+
+def test_skip_startup_tasks_drives_startup_to_complete(api_client):
+    """With SLOPSMITH_SKIP_STARTUP_TASKS set, the startup hook must:
+      * skip plugin loading and the background scan,
+      * leave the status in a terminal `complete` phase with running=False,
+      * reset current_plugin/loaded/total so stale data from a prior import
+        doesn't bleed into the skip branch.
+    """
+    _tc, server = api_client
+    status = server._startup_status
+    assert status["running"] is False
+    assert status["phase"] == "complete"
+    assert status["error"] is None
+    assert status["current_plugin"] == ""
+    assert status["loaded"] == 0
+    assert status["total"] == 0
+
+
+def test_skip_startup_tasks_does_not_call_load_plugins_or_scan(tmp_path, monkeypatch, isolate_logging):
+    """Concrete contract check: with the skip flag set, the startup hook
+    must not invoke `load_plugins` *or* `startup_scan`. The status
+    assertions in `test_skip_startup_tasks_drives_startup_to_complete`
+    only show the end state — they'd still pass if either ran and the
+    status was reset, so they don't prove the skip path actually skipped.
+    The background scan in particular doesn't touch _startup_status, so
+    without a dedicated tripwire a regression here would be silent."""
+    from fastapi.testclient import TestClient
+
+    monkeypatch.setenv("CONFIG_DIR", str(tmp_path))
+    monkeypatch.setenv("SLOPSMITH_SKIP_STARTUP_TASKS", "1")
+    sys.modules.pop("server", None)
+    plugins_snapshot = _snapshot_loaded_plugins()
+    server = importlib.import_module("server")
+
+    load_calls: list[tuple] = []
+    scan_calls: list[tuple] = []
+
+    def _load_tripwire(*args, **kwargs):
+        load_calls.append((args, kwargs))
+
+    def _scan_tripwire(*args, **kwargs):
+        scan_calls.append((args, kwargs))
+
+    # Patch the names the startup hook resolves at call time. server.py
+    # does `from plugins import load_plugins, ...`, and `startup_scan` is
+    # defined in server.py itself — both end up bound on the server module
+    # and that's what `@app.on_event("startup")` looks up.
+    monkeypatch.setattr(server, "load_plugins", _load_tripwire)
+    monkeypatch.setattr(server, "startup_scan", _scan_tripwire)
+
+    try:
+        with TestClient(server.app):
+            pass
+    finally:
+        conn = getattr(getattr(server, "meta_db", None), "conn", None)
+        if conn is not None:
+            conn.close()
+        _restore_loaded_plugins(plugins_snapshot)
+
+    assert load_calls == [], f"load_plugins was invoked despite skip flag: {load_calls}"
+    assert scan_calls == [], f"startup_scan was invoked despite skip flag: {scan_calls}"
+
+
+def test_skip_startup_tasks_clears_stale_plugin_registry(tmp_path, monkeypatch, isolate_logging):
+    """The plugins module is not re-imported when tests reload `server`, so
+    LOADED_PLUGINS can carry stale entries from a previous test's startup.
+    The skip branch must clear it so /api/plugins doesn't expose stale
+    plugins despite reporting zero loaded plugins in the status."""
+    from fastapi.testclient import TestClient
+
+    monkeypatch.setenv("CONFIG_DIR", str(tmp_path))
+    monkeypatch.setenv("SLOPSMITH_SKIP_STARTUP_TASKS", "1")
+
+    # Snapshot the registry as the importer left it so we can restore it
+    # after this test mutates it — otherwise the cleared state would leak
+    # to any later test that imports `plugins`.
+    plugins_snapshot = _snapshot_loaded_plugins()
+    server = None
+
+    try:
+        # Pre-seed plugins.LOADED_PLUGINS with a fake entry from a
+        # "previous run". The try/finally wraps this mutation so that even
+        # if the subsequent server import raises, the sentinel doesn't
+        # leak into later tests.
+        import plugins as plugins_mod
+        sentinel = {"id": "stale.previous-run", "name": "stale"}
+        with plugins_mod.PLUGINS_LOCK:
+            plugins_mod.LOADED_PLUGINS.clear()
+            plugins_mod.LOADED_PLUGINS.append(sentinel)
+
+        sys.modules.pop("server", None)
+        server = importlib.import_module("server")
+
+        with TestClient(server.app):
+            pass
+        # After the skip branch runs, the stale entry must be gone.
+        assert sentinel not in plugins_mod.LOADED_PLUGINS
+        assert plugins_mod.LOADED_PLUGINS == []
+    finally:
+        conn = getattr(getattr(server, "meta_db", None), "conn", None) if server else None
+        if conn is not None:
+            conn.close()
+        _restore_loaded_plugins(plugins_snapshot)

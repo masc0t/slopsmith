@@ -77,6 +77,7 @@ test('default 2D renderer threads note state into drawNote / drawSustains / chor
 test('3D highway captures bundle.getNoteState and overrides legacy hit/miss with the provider verdict', () => {
     const src = fs.readFileSync(highway3dJs, 'utf8');
     assert.match(src, /_ndGetNoteState\s*=\s*\(bundle\s*&&\s*typeof\s+bundle\.getNoteState\s*===\s*['"]function['"]\)\s*\?\s*bundle\.getNoteState\s*:\s*null/, 'update() must capture bundle.getNoteState into _ndGetNoteState');
-    // Provider verdict wins: miss => not _showHit; otherwise provider state or the proximity fallback.
-    assert.match(src, /const\s+_showHit\s*=\s*\(\s*_ndState\s*===\s*['"]miss['"]\s*\)\s*\?\s*false\s*:\s*\(\s*_ndState\s*\?\s*_ndGood\s*:\s*hit\s*\)/, '_showHit must honor a provider "miss" and fall back to the proximity heuristic only with no verdict');
+    // Provider verdict wins: miss => not _showHit; otherwise provider state
+    // or the legacy fallback (`hit`) plus the pre-hit ghost window preview.
+    assert.match(src, /const\s+_showHit\s*=\s*\(\s*_ndState\s*===\s*['"]miss['"]\s*\)\s*\?\s*false\s*:\s*\(\s*_ndState\s*\?\s*_ndGood\s*:\s*\(\s*hit\s*\|\|\s*\(\s*n\.f\s*>\s*0\s*&&\s*inGhostWin\s*\)\s*\)\s*\)/, '_showHit must honor a provider "miss" and fall back to the hit/ghost heuristic only with no verdict');
 });

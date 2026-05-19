@@ -46,6 +46,7 @@
             <div class="hidden md:flex items-center gap-8">
                 <a href="#" onclick="showScreen('home');return false" class="text-sm text-gray-400 hover:text-white transition">Library</a>
                 <a href="#" onclick="showScreen('favorites');return false" class="text-sm text-gray-400 hover:text-white transition">Favorites</a>
+                <a href="#" onclick="document.getElementById('upload-songs-file').click();return false" class="text-sm text-gray-400 hover:text-white transition">Upload</a>
                 <span id="nav-plugins" class="contents"></span>
                 <a href="#" onclick="showScreen('settings');return false" class="text-sm text-gray-400 hover:text-white transition">Settings</a>
             </div>
@@ -58,6 +59,7 @@
             <div class="px-6 py-4 flex flex-col gap-3">
                 <a href="#" onclick="showScreen('home');this.parentElement.parentElement.classList.add('hidden');return false" class="text-gray-400 hover:text-white">Library</a>
                 <a href="#" onclick="showScreen('favorites');this.parentElement.parentElement.classList.add('hidden');return false" class="text-gray-400 hover:text-white">Favorites</a>
+                <a href="#" onclick="document.getElementById('upload-songs-file').click();this.parentElement.parentElement.classList.add('hidden');return false" class="text-gray-400 hover:text-white">Upload</a>
                 <span id="mobile-nav-plugins" class="flex flex-col gap-2 border-t border-b border-gray-800 py-2 my-1">
                     <span class="text-xs text-gray-600 uppercase tracking-wider">Plugins</span>
                 </span>
@@ -65,6 +67,10 @@
             </div>
         </div>
     </nav>
+
+    <!-- Hidden file input shared by the navbar "Upload" link. Kept at body
+         level so it stays reachable regardless of which screen is active. -->
+    <input type="file" id="upload-songs-file" accept=".psarc,.sloppak" multiple class="hidden" onchange="uploadSongs(this.files); this.value=''">
 
     <!-- ══ HOME (Hero + Library) ══════════════════════════════════════════ -->
     <div id="home" class="screen active">
@@ -103,6 +109,7 @@
                         <option value="">All formats</option>
                         <option value="psarc">PSARC</option>
                         <option value="sloppak">Sloppak</option>
+                        <option value="loose">Folder</option>
                     </select>
                     <!-- Tree controls -->
                     <button onclick="toggleAllArtists(true)" class="lib-tree-ctrl bg-dark-700 border border-gray-800 rounded-xl px-3 py-2.5 text-sm text-gray-400 hover:text-white transition">Expand All</button>
@@ -344,6 +351,17 @@
                         <div id="plugin-settings" class="space-y-3"></div>
                     </div>
                 </section>
+
+                <!-- ── About / Source / License (AGPL §13 disclosure) ──────── -->
+                <section>
+                    <h3 class="text-xs font-semibold uppercase tracking-wider text-gray-500 mb-4">About</h3>
+                    <div class="space-y-2 text-sm text-gray-400">
+                        <div>Slopsmith <span id="app-version-about" class="text-gray-500"></span></div>
+                        <div>Licensed under <a id="about-license-link" href="https://github.com/byrongamatos/slopsmith/blob/main/LICENSE" target="_blank" rel="noopener" class="text-accent hover:text-accent-light underline">GNU AGPL v3.0</a>.</div>
+                        <div><a id="about-source-link" href="https://github.com/byrongamatos/slopsmith" target="_blank" rel="noopener" class="text-accent hover:text-accent-light underline">Source code repository</a></div>
+                        <p class="text-xs text-gray-600 mt-2">Slopsmith is free software. You can redistribute it and modify it under the terms of the AGPL. If you run a modified version that interacts with users over a network, you must make the modified source available to those users.</p>
+                    </div>
+                </section>
             </div>
         </div>
     </div>
@@ -431,6 +449,9 @@
             <span id="mastery-slider-label" class="text-xs text-gray-500 ml-1">Difficulty</span>
             <input type="range" id="mastery-slider" min="0" max="100" value="100" step="5" oninput="setMastery(this.value)" class="w-20 accent-accent" title="Master difficulty — low = simpler chart, high = full" aria-labelledby="mastery-slider-label">
             <span id="mastery-label" class="text-xs text-gray-500 w-10">100%</span>
+            <span id="player-av-offset-slider-label" class="text-xs text-gray-500 ml-1">A/V sync offset (ms)</span>
+            <input type="range" id="player-av-offset-slider" min="-1000" max="1000" value="0" step="1" oninput="setAvOffsetMs(this.value)" class="w-20 accent-accent" title="A/V sync offset (ms) — positive = audio plays ahead of visuals. [ and ] adjust ±10 ms (Shift = ±50). Double-click to reset." ondblclick="setAvOffsetMs(0)" aria-labelledby="player-av-offset-slider-label">
+            <span id="player-av-offset-label" class="text-xs text-gray-500 w-12 tabular-nums">+0ms</span>
             <div id="mixer-control">
                 <div id="mixer-anchor" class="relative">
                     <button id="btn-mixer" type="button" onclick="window.slopsmith.audio.toggleMixer()" class="px-3 py-1.5 bg-dark-600 hover:bg-dark-500 rounded-lg text-xs text-gray-300 transition" aria-haspopup="true" aria-expanded="false" aria-controls="mixer-popover" title="Audio mixer">Mixer ▾</button>
@@ -462,8 +483,7 @@
                 <option value="">Saved Loops</option>
             </select>
             <button onclick="deleteSelectedLoop()" id="btn-loop-delete" class="px-2 py-1.5 bg-dark-600 hover:bg-red-900/50 rounded-lg text-xs text-gray-500 hover:text-red-400 transition hidden" title="Delete selected loop">✕</button>
-            <button id="pg-tour-btn" onclick="window.slopsmithTour?.start('player_guide')" class="ml-auto px-2 py-1.5 bg-dark-600 hover:bg-dark-500 rounded-lg text-xs text-gray-400 hover:text-white transition" title="Player controls guide">?</button>
-            <button onclick="showScreen('home')" class="px-3 py-1.5 bg-dark-600 hover:bg-red-900/50 rounded-lg text-xs text-gray-400 hover:text-red-400 transition">✕ Close</button>
+            <button onclick="showScreen('home')" class="ml-auto px-3 py-1.5 bg-dark-600 hover:bg-red-900/50 rounded-lg text-xs text-gray-400 hover:text-red-400 transition">✕ Close</button>
         </div>
     </div>
 

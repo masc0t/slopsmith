@@ -17,6 +17,22 @@ jobs:
           python-version: '3.12'
           cache: 'pip'
 
+      - name: Guard against print() / traceback.print_exc() in server.py and lib/
+        run: |
+          # git grep: tracked files only — no .pyc / __pycache__ noise from
+          # later pytest runs. Covers both audited patterns from #155 / #242.
+          # `(^|[^A-Za-z0-9_])` anchor avoids matching suffixes like `myprint(`;
+          # POSIX leaves `\b` undefined, so we use an explicit character class.
+          hits=$(git grep -nE '(^|[^A-Za-z0-9_])(print|traceback\.print_exc)[[:space:]]*\(' -- server.py lib/ || true)
+          if [ -n "$hits" ]; then
+            echo "$hits"
+            first=$(printf '%s\n' "$hits" | head -n1)
+            file=$(printf '%s' "$first" | cut -d: -f1)
+            line=$(printf '%s' "$first" | cut -d: -f2)
+            echo "::error file=${file},line=${line}::print() or traceback.print_exc() found in server.py or lib/. Use the slopsmith logger (lib/logging_setup.py) — see issues #155 / #242."
+            exit 1
+          fi
+
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip

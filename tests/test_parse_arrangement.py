@@ -23,6 +23,99 @@ _TUNING_AND_TEMPLATES = (
 )
 
 
+def test_hand_shape_parses_arpeggio_attribute(tmp_path):
+    xml = (
+        "<song>"
+        + _TUNING_AND_TEMPLATES
+        + '<levels count="1">'
+        + '<level difficulty="0">'
+        + '<notes count="0"/>'
+        + '<chords count="0"/>'
+        + '<anchors count="0"/>'
+        + '<handShapes count="1">'
+        + '<handShape chordId="2" startTime="1.0" endTime="2.0" arpeggio="1"/>'
+        + "</handShapes>"
+        + "</level>"
+        + "</levels>"
+        + "</song>"
+    )
+    arr = parse_arrangement(_write_xml(tmp_path, xml))
+    assert len(arr.hand_shapes) == 1
+    assert arr.hand_shapes[0].chord_id == 2
+    assert arr.hand_shapes[0].arpeggio is True
+
+
+def test_chord_template_parses_display_name_arpeggio_marker(tmp_path):
+    xml = (
+        "<song>"
+        + '<tuning string0="0" string1="0" string2="0" string3="0" string4="0" string5="0"/>'
+        + '<chordTemplates count="1">'
+        + '<chordTemplate chordName="Amin" displayName="Amin-arp" '
+        + 'finger1="1" finger2="2" fret1="5" fret2="7"/>'
+        + "</chordTemplates>"
+        + '<levels count="1">'
+        + '<level difficulty="0">'
+        + '<notes count="0"/>'
+        + '<chords count="0"/>'
+        + '<anchors count="0"/>'
+        + '<handShapes count="0"/>'
+        + "</level>"
+        + "</levels>"
+        + "</song>"
+    )
+    arr = parse_arrangement(_write_xml(tmp_path, xml))
+    assert len(arr.chord_templates) == 1
+    assert arr.chord_templates[0].name == "Amin"
+    assert arr.chord_templates[0].display_name == "Amin-arp"
+    assert arr.chord_templates[0].arpeggio is True
+
+
+def test_chord_template_parses_explicit_arpeggio_attribute(tmp_path):
+    xml = (
+        "<song>"
+        + '<tuning string0="0" string1="0" string2="0" string3="0" string4="0" string5="0"/>'
+        + '<chordTemplates count="1">'
+        + '<chordTemplate chordName="Amin" displayName="Amin" arpeggio="true" '
+        + 'finger1="1" finger2="2" fret1="5" fret2="7"/>'
+        + "</chordTemplates>"
+        + '<levels count="1">'
+        + '<level difficulty="0">'
+        + '<notes count="0"/>'
+        + '<chords count="0"/>'
+        + '<anchors count="0"/>'
+        + '<handShapes count="0"/>'
+        + "</level>"
+        + "</levels>"
+        + "</song>"
+    )
+    arr = parse_arrangement(_write_xml(tmp_path, xml))
+    assert len(arr.chord_templates) == 1
+    assert arr.chord_templates[0].name == "Amin"
+    assert arr.chord_templates[0].display_name == "Amin"
+    assert arr.chord_templates[0].arpeggio is True
+
+
+def test_parse_note_parses_vibrato_attribute(tmp_path):
+    xml = (
+        "<song>"
+        + _TUNING_AND_TEMPLATES
+        + '<levels count="1">'
+        + '<level difficulty="0">'
+        + '<notes count="1">'
+        + '<note time="1.0" string="0" fret="5" sustain="0.5" vibrato="1"/>'
+        + "</notes>"
+        + '<chords count="0"/>'
+        + '<anchors count="0"/>'
+        + '<handShapes count="0"/>'
+        + "</level>"
+        + "</levels>"
+        + "</song>"
+    )
+    arr = parse_arrangement(_write_xml(tmp_path, xml))
+    assert len(arr.notes) == 1
+    assert arr.notes[0].vibrato is True
+
+
 def _song(levels_xml: str, phrases_xml: str = "", iters_xml: str = "") -> str:
     return (
         "<song>"
@@ -310,3 +403,89 @@ def test_parse_all_phrase_iterations_out_of_range_falls_back(tmp_path):
 
     assert arr.phrases is None
     assert [(n.time, n.fret) for n in arr.notes] == [(1.0, 5), (2.0, 3)]
+
+
+# ── Extended-range tuning + chord templates (7/8-string, 5/6-string bass) ───
+
+def test_parse_arrangement_preserves_7_string_tuning(tmp_path):
+    """`string6` on <tuning> must be appended so 7/8-string arrangements
+    round-trip through GP → XML → parse correctly."""
+    xml = (
+        "<song>"
+        '<tuning string0="0" string1="0" string2="0" string3="0" '
+        'string4="0" string5="0" string6="0"/>'
+        "<chordTemplates/>"
+        '<levels count="1">'
+        + _level(0, [(1.0, 0, 5)])
+        + "</levels>"
+        "</song>"
+    )
+    arr = parse_arrangement(_write_xml(tmp_path, xml))
+    assert len(arr.tuning) == 7
+    assert arr.tuning == [0, 0, 0, 0, 0, 0, 0]
+
+
+def test_parse_arrangement_preserves_8_string_drop_tuning(tmp_path):
+    """8-string with low F# (`string7`) and Drop D on the lowest string."""
+    xml = (
+        "<song>"
+        '<tuning string0="-2" string1="0" string2="0" string3="0" '
+        'string4="0" string5="0" string6="0" string7="0"/>'
+        "<chordTemplates/>"
+        '<levels count="1">'
+        + _level(0, [(1.0, 0, 5)])
+        + "</levels>"
+        "</song>"
+    )
+    arr = parse_arrangement(_write_xml(tmp_path, xml))
+    assert arr.tuning == [-2, 0, 0, 0, 0, 0, 0, 0]
+
+
+def test_parse_arrangement_extended_chord_template(tmp_path):
+    """fret6/finger6 attrs round-trip into the parsed ChordTemplate."""
+    xml = (
+        "<song>"
+        '<tuning string0="0" string1="0" string2="0" string3="0" '
+        'string4="0" string5="0" string6="0"/>'
+        "<chordTemplates>"
+        '<chordTemplate chordName="Em7-ext" '
+        'fret0="0" fret1="0" fret2="0" fret3="2" '
+        'fret4="2" fret5="0" fret6="0" '
+        'finger0="-1" finger1="-1" finger2="-1" finger3="2" '
+        'finger4="3" finger5="-1" finger6="-1"/>'
+        "</chordTemplates>"
+        '<levels count="1">'
+        + _level(0, [(1.0, 0, 0)])
+        + "</levels>"
+        "</song>"
+    )
+    arr = parse_arrangement(_write_xml(tmp_path, xml))
+    assert len(arr.chord_templates) == 1
+    ct = arr.chord_templates[0]
+    assert ct.name == "Em7-ext"
+    assert ct.frets == [0, 0, 0, 2, 2, 0, 0]
+    assert ct.fingers == [-1, -1, -1, 2, 3, -1, -1]
+
+
+def test_parse_arrangement_6_string_template_no_width_inflation(tmp_path):
+    """A plain 6-string chord template parses with length-6 frets/fingers
+    when no `fret6`/`finger6` is present — no spurious slot expansion."""
+    xml = (
+        "<song>"
+        '<tuning string0="0" string1="0" string2="0" string3="0" '
+        'string4="0" string5="0"/>'
+        "<chordTemplates>"
+        '<chordTemplate chordName="C" '
+        'fret0="-1" fret1="3" fret2="2" fret3="0" fret4="1" fret5="0" '
+        'finger0="-1" finger1="3" finger2="2" finger3="-1" '
+        'finger4="1" finger5="-1"/>'
+        "</chordTemplates>"
+        '<levels count="1">'
+        + _level(0, [(1.0, 0, 0)])
+        + "</levels>"
+        "</song>"
+    )
+    arr = parse_arrangement(_write_xml(tmp_path, xml))
+    ct = arr.chord_templates[0]
+    assert len(ct.frets) == 6
+    assert len(ct.fingers) == 6

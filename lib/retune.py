@@ -16,6 +16,7 @@ from pathlib import Path
 log = logging.getLogger("slopsmith.lib.retune")
 
 from patcher import unpack_psarc, pack_psarc
+from audio import _vgmstream_cmd
 
 RSCLI = Path(os.environ.get("RSCLI_PATH", str(Path(__file__).parent / "tools" / "rscli" / "RsCli")))
 
@@ -90,12 +91,22 @@ def _pitch_shift_wem(wem_path: Path, semitones: int, on_progress=None) -> bool:
 
     # Step 1: Decode WEM to WAV
     decoded = False
-    if shutil.which("vgmstream-cli"):
-        r = subprocess.run(
-            ["vgmstream-cli", "-o", str(wav_decoded), str(wem_path)],
-            capture_output=True, text=True,
-        )
-        if r.returncode == 0 and wav_decoded.exists() and wav_decoded.stat().st_size > 100:
+    vgmstream = _vgmstream_cmd()
+    if vgmstream:
+        r = None
+        try:
+            r = subprocess.run(
+                [vgmstream, "-o", str(wav_decoded), str(wem_path)],
+                # `errors="replace"` — without it a decoder that emits
+                # non-UTF-8 bytes raises UnicodeDecodeError after the
+                # subprocess finishes, which would slip past the
+                # OSError/timeout handler below and skip the ffmpeg
+                # fallback. Matches the audio.py decode helper.
+                capture_output=True, text=True, errors="replace", timeout=120,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            log.warning("vgmstream decode failed for %s: %s", wem_path.name, exc)
+        if r is not None and r.returncode == 0 and wav_decoded.exists() and wav_decoded.stat().st_size > 100:
             decoded = True
             log.info("Decoded with vgmstream (%d bytes)", wav_decoded.stat().st_size)
             if on_progress:
@@ -104,7 +115,7 @@ def _pitch_shift_wem(wem_path: Path, semitones: int, on_progress=None) -> bool:
     if not decoded and shutil.which("ffmpeg"):
         r = subprocess.run(
             ["ffmpeg", "-y", "-i", str(wem_path), str(wav_decoded)],
-            capture_output=True, text=True,
+            capture_output=True, text=True, errors="replace",
         )
         if r.returncode == 0 and wav_decoded.exists() and wav_decoded.stat().st_size > 100:
             decoded = True

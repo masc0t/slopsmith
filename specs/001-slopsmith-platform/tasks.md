@@ -32,7 +32,7 @@ These are the cross-cutting pieces every user story depends on.
 - [x] T005 [DONE] [P] Dockerfile + docker-compose.yml with vgmstream / FFmpeg / FluidSynth / RsCli baked in
 - [x] T006 [DONE] CI workflow runs pytest on Python 3.12 against every push/PR to `main` — `.github/workflows/tests.yml`
 - [x] T007 [DONE] [P] `VERSION` file + `/api/version` endpoint + auto-bump workflow — `server.py:1340`, `.github/workflows/sync-version.yml`
-- [ ] T008 [OPEN] Migrate remaining `print()` / `traceback.print_exc()` calls in `server.py` to `logging` (phase 2 of #155 noted in `CHANGELOG.md`)
+- [x] T008 [DONE] Migrated `print()` / `traceback.print_exc()` calls in `server.py` and `lib/` to `logging` — commit `3b08488` (PR #159); regression guarded by `.github/workflows/tests.yml`
 - [ ] T009 [OPEN] Document `MetadataDB` schema migration policy in `CLAUDE.md` (constitution mandates additive/idempotent migrations but the in-startup migration logic is not explicitly described)
 
 **Checkpoint**: Foundation in place — every user story below sits on top of this.
@@ -240,7 +240,7 @@ end-to-end without the in-game UI.
 - [ ] T242 [OPEN] [P] pytest coverage for pure helpers in `lib/sloppak_convert.py` (README explicitly calls this out as a natural follow-up target)
 - [ ] T243 [OPEN] [P] pytest coverage for tempo/tick math in `lib/gp2rs.py` (README explicitly calls this out)
 - [ ] T244 [OPEN] [P] Document the published browser support matrix (closes T080)
-- [ ] T245 [OPEN] [P] Audit remaining `print()` calls across `server.py` and `lib/` and migrate to `logging` (closes T008, completes phase 2 of slopsmith#155)
+- [x] T245 [DONE] [P] Audit of `print()` calls across `server.py` and `lib/` complete — zero residual calls (commit `3b08488` / PR #159); CI grep guard added in `.github/workflows/tests.yml`
 - [ ] T246 [OPEN] [P] CONTRIBUTING.md (the spec-kit `constitution.md` exists but a contributor-focused, plugin-author-friendly entry point would shorten the on-ramp)
 
 ---

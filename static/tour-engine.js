@@ -1,11 +1,42 @@
 (function () {
     'use strict';
 
-    // keyed by pluginId
-    const _tourPlugins = {};   // { id, name, has_screen } for tour-eligible plugins
-    const _registry = {};      // registered imperative overrides
-    let _activeTour = null;    // currently running Shepherd Tour instance
+    // ─────────────────────────────────────────────────────────────────────────
+    // Slopsmith tour engine — consolidated menu version.
+    //
+    // One floating ? button at the bottom-right of the viewport. Click it to
+    // see every tour that's relevant to the current screen. Click a tour to
+    // start it (Shepherd-driven, same as before).
+    //
+    // Screen relevance defaults:
+    //   - has_screen: true   → tour relevant on the plugin's own dedicated
+    //                          screen (`plugin-<id>`)
+    //   - otherwise          → tour relevant on the player screen
+    //   - plugins can override via slopsmithTour.register(id, { screens: [...] })
+    //
+    // First-visit toast: on screen:changed, if any relevant tour is unseen
+    // and un-dismissed, a small "Take a quick tour of X?" prompt pops next
+    // to the ? button (or queues if multiple). Same hasSeen/hasDismissed
+    // logic as the previous design — no UX regression for users who've
+    // already taken the per-plugin tours, just one button instead of N.
+    // ─────────────────────────────────────────────────────────────────────────
+
+    // _tourPlugins: { id, name, has_screen, is_viz } populated from /api/plugins
+    //   (is_viz === true means the plugin declared type:"visualization" — used
+    //   below to gate viz tours on the currently-active viz so we don't list
+    //   tours whose DOM only exists when that viz is rendering).
+    // _registry: imperative overrides keyed by plugin id — buildSteps,
+    //   onStart, onComplete, plus an optional screens:[] override that
+    //   wins over the defaults in _defaultScreensFor().
+    const _tourPlugins = {};
+    const _registry = {};
+    const _deprecationWarned = new Set(); // pluginIds we've already warned about
+    let _activeTour = null;
     let _activeTourPluginId = null;
+    let _currentScreenId = null;
+    let _menuBtn = null;       // the persistent ? button (lazily mounted)
+    let _menuPopover = null;   // the menu of available tours
+    let _activeToastPluginId = null; // plugin currently being prompted via toast
 
     // ── localStorage helpers ──────────────────────────────────────────────
 
@@ -18,85 +49,302 @@
     function hasDismissed(pluginId) {
         try { return !!localStorage.getItem(_dismissedKey(pluginId)); } catch { return false; }
     }
-
     function _markSeen(pluginId)      { try { localStorage.setItem(_seenKey(pluginId), '1'); } catch { /* private mode / quota */ } }
     function _markDismissed(pluginId) { try { localStorage.setItem(_dismissedKey(pluginId), '1'); } catch { /* private mode / quota */ } }
 
-    // ── Trigger injection ─────────────────────────────────────────────────
+    // ── Screen relevance ──────────────────────────────────────────────────
 
-    function _findTriggerByPluginId(container, pluginId) {
-        const triggers = container.querySelectorAll('.slopsmith-tour-trigger');
-        for (const trigger of triggers) {
-            if (trigger.dataset.pluginId === pluginId) return trigger;
+    function _defaultScreensFor(meta) {
+        if (meta.has_screen) return ['plugin-' + meta.id];
+        return ['player'];
+    }
+
+    function _screensFor(pluginId) {
+        const reg = _registry[pluginId];
+        if (reg && Array.isArray(reg.screens) && reg.screens.length) return reg.screens;
+        const meta = _tourPlugins[pluginId];
+        if (!meta) return [];
+        return _defaultScreensFor(meta);
+    }
+
+    // Viz plugins' tours typically reference plugin-specific DOM that only
+    // exists while that viz is rendering (e.g. 3D Highway's .h3d-wrap). On
+    // the player screen we therefore only treat the active viz as relevant,
+    // not every viz plugin that happens to ship a tour. Mirrors the same
+    // localStorage/picker/auto-match precedence the previous per-plugin
+    // _injectPlayerVizTrigger used.
+    function _currentVizPluginId() {
+        // Picker is the runtime source of truth — app.js treats
+        // localStorage as a persistence mirror that can be stale or
+        // unwritable (private mode / sandboxed contexts), so read the
+        // picker first and only fall back to localStorage when it's
+        // not in the DOM yet.
+        const picker = document.getElementById('viz-picker');
+        let sel = picker ? picker.value : null;
+        if (!sel) {
+            try { sel = localStorage.getItem('vizSelection'); } catch { /* private mode */ }
+        }
+        if (sel && sel !== 'auto' && sel !== 'default') return sel;
+        if (sel !== 'auto') return null;
+
+        const songInfo = (typeof highway !== 'undefined' && typeof highway.getSongInfo === 'function')
+            ? (highway.getSongInfo() || {}) : {};
+        const candidateIds = picker
+            ? Array.from(picker.options).map(o => o.value).filter(v => v !== 'auto' && v !== 'default')
+            : Object.keys(_tourPlugins).filter(id => _tourPlugins[id].is_viz);
+        for (const pluginId of candidateIds) {
+            const factory = window['slopsmithViz_' + pluginId];
+            if (typeof factory !== 'function') continue;
+            const predicate = factory.matchesArrangement;
+            if (typeof predicate !== 'function') continue;
+            try { if (predicate(songInfo)) return pluginId; } catch { /* ignore */ }
         }
         return null;
     }
 
-    // opts.bottom = true  →  button anchored to bottom-right (for #player where
-    //                         the top is overlapped by the transparent nav bar)
-    // containerOrSelector may be a DOM Element or a CSS selector string.
-    function injectTrigger(pluginId, containerOrSelector, opts) {
-        opts = opts || {};
-        let container;
-        if (containerOrSelector instanceof Element) {
-            container = containerOrSelector;
-        } else {
-            try {
-                container = document.querySelector(containerOrSelector);
-            } catch (e) {
-                console.warn('[slopsmithTour] injectTrigger: invalid selector', containerOrSelector, e);
-                return;
+    // `activeVizId` is the precomputed result of _currentVizPluginId() for
+    // this refresh — callers pass it in so we don't re-run the picker /
+    // localStorage / matchesArrangement chain once per plugin per refresh.
+    // Null is allowed: the gate falls open and viz plugins are never
+    // relevant (matches "no viz active").
+    function _isRelevant(pluginId, screenId, activeVizId) {
+        if (!screenId) return false;
+        if (_screensFor(pluginId).indexOf(screenId) === -1) return false;
+        const meta = _tourPlugins[pluginId];
+        if (meta && meta.is_viz && screenId === 'player') {
+            return activeVizId === pluginId;
+        }
+        return true;
+    }
+
+    function _relevantPlugins(screenId) {
+        // Resolve the active viz once and reuse across every plugin's
+        // relevance check — the resolver can walk the picker options and
+        // call matchesArrangement() predicates in auto mode, which is
+        // wasted work per plugin.
+        const activeVizId = (screenId === 'player') ? _currentVizPluginId() : null;
+        return Object.values(_tourPlugins).filter(p => _isRelevant(p.id, screenId, activeVizId));
+    }
+
+    function _unseenRelevant(screenId) {
+        return _relevantPlugins(screenId).filter(p => !hasSeen(p.id) && !hasDismissed(p.id));
+    }
+
+    // ── Menu UI ────────────────────────────────────────────────────────────
+
+    function _ensureMenu() {
+        if (_menuBtn) return;
+        _menuBtn = document.createElement('button');
+        _menuBtn.className = 'slopsmith-tour-menu-btn';
+        _menuBtn.setAttribute('aria-label', 'Available tours');
+        _menuBtn.setAttribute('aria-haspopup', 'dialog');
+        _menuBtn.setAttribute('aria-expanded', 'false');
+        _menuBtn.setAttribute('aria-controls', 'slopsmith-tour-menu-popover');
+        _menuBtn.title = 'Available tours';
+        _menuBtn.textContent = '?';
+        _menuBtn.style.display = 'none';
+        _menuBtn.addEventListener('click', _toggleMenu);
+        document.body.appendChild(_menuBtn);
+
+        _menuPopover = document.createElement('div');
+        _menuPopover.id = 'slopsmith-tour-menu-popover';
+        _menuPopover.className = 'slopsmith-tour-menu-popover';
+        // Plain popover; not a WAI-ARIA "menu" — that role implies roving
+        // focus + arrow-key navigation we don't implement (the rows are
+        // ordinary <button>s, traversed via normal tab order).
+        _menuPopover.setAttribute('role', 'dialog');
+        _menuPopover.setAttribute('aria-label', 'Available tours');
+        _menuPopover.style.display = 'none';
+        document.body.appendChild(_menuPopover);
+
+        // Outside-click closes the menu (capture so we run before child handlers).
+        document.addEventListener('pointerdown', (e) => {
+            if (_menuPopover.style.display === 'none') return;
+            const t = e.target;
+            if (t && typeof t.closest === 'function' &&
+                (t.closest('.slopsmith-tour-menu-popover') || t.closest('.slopsmith-tour-menu-btn'))) return;
+            _hideMenu();
+        }, true);
+
+        document.addEventListener('keydown', (e) => {
+            if (e.key === 'Escape' && _menuPopover.style.display !== 'none') _hideMenu();
+        });
+    }
+
+    function _showMenu() {
+        if (!_menuPopover) return;
+        _menuPopover.style.display = '';
+        if (_menuBtn) _menuBtn.setAttribute('aria-expanded', 'true');
+        // Move focus into the dialog so keyboard / screen-reader users
+        // land on the first tour item rather than tabbing in from the
+        // surrounding page. Pointer-only users are unaffected — the
+        // focus ring only renders under :focus-visible.
+        const firstItem = _menuPopover.querySelector('.tour-menu-item');
+        if (firstItem) firstItem.focus();
+    }
+    function _hideMenu() {
+        if (!_menuPopover) return;
+        const wasOpen = _menuPopover.style.display !== 'none';
+        _menuPopover.style.display = 'none';
+        if (_menuBtn) {
+            _menuBtn.setAttribute('aria-expanded', 'false');
+            // Return focus to the trigger when closing — standard
+            // dialog dismissal behavior so the user doesn't lose their
+            // place in the tab order. Skipped when the popover wasn't
+            // actually open (e.g. _updateMenuVisibility hides an
+            // already-empty popover) to avoid stealing focus from
+            // wherever the user happens to be. Also skipped when the
+            // button itself is hidden (focus() is a no-op on
+            // display:none elements and would leave focus in a stuck
+            // state) — relevance dropped to zero and the user's
+            // focus should fall back naturally to document.body.
+            if (wasOpen && document.activeElement !== _menuBtn &&
+                _menuPopover.contains(document.activeElement) &&
+                _menuBtn.style.display !== 'none') {
+                _menuBtn.focus();
             }
         }
-        if (!container) return;
-        if (_findTriggerByPluginId(container, pluginId)) return;
+    }
+    function _toggleMenu() {
+        if (!_menuPopover) return;
+        if (_menuPopover.style.display === 'none') {
+            _rebuildMenuItems();
+            _showMenu();
+            _dismissToast();
+        } else {
+            _hideMenu();
+        }
+    }
 
-        // Ensure the container establishes a positioning context so the
-        // absolutely-positioned trigger button anchors to it, not the page.
-        if (window.getComputedStyle(container).position === 'static') {
-            container.style.position = 'relative';
+    function _rebuildMenuItems() {
+        if (!_menuPopover) return;
+        while (_menuPopover.firstChild) _menuPopover.removeChild(_menuPopover.firstChild);
+
+        const plugins = _relevantPlugins(_currentScreenId);
+        if (!plugins.length) {
+            const empty = document.createElement('div');
+            empty.className = 'tour-menu-empty';
+            empty.textContent = 'No tours available on this screen.';
+            _menuPopover.appendChild(empty);
+            return;
         }
 
-        const btn = document.createElement('button');
-        btn.className = 'slopsmith-tour-trigger' +
-            ((hasSeen(pluginId) || hasDismissed(pluginId)) ? '' : ' first-visit') +
-            (opts.bottom ? ' position-bottom' : '');
-        btn.dataset.pluginId = pluginId;
-        btn.title = 'Take a tour of this plugin';
-        btn.setAttribute('aria-label', 'Take a tour of this plugin');
-        btn.textContent = '?';
-        btn.addEventListener('click', () => {
-            _removePrompt(pluginId, container);
-            start(pluginId);
+        const header = document.createElement('div');
+        header.className = 'tour-menu-header';
+        header.textContent = 'Available tours';
+        _menuPopover.appendChild(header);
+
+        plugins.forEach(p => {
+            const row = document.createElement('button');
+            row.className = 'tour-menu-item';
+            row.dataset.pluginId = p.id;
+
+            const label = document.createElement('span');
+            label.className = 'tour-menu-item-label';
+            label.textContent = p.name || p.id;
+            row.appendChild(label);
+
+            // Status badge — only rendered when there's something to show.
+            // Three states: NEW (never seen + never dismissed), ✓ (completed
+            // at least once), or no badge at all (dismissed without taking
+            // the tour). The "dismissed but not seen" case used to render
+            // an empty span — slopsmith#272 review.
+            const seen = hasSeen(p.id);
+            const dismissed = hasDismissed(p.id);
+            if (!seen && !dismissed) {
+                const status = document.createElement('span');
+                status.className = 'tour-menu-item-status is-new';
+                status.textContent = 'NEW';
+                row.appendChild(status);
+            } else if (seen) {
+                const status = document.createElement('span');
+                status.className = 'tour-menu-item-status is-seen';
+                status.textContent = '✓';
+                row.appendChild(status);
+            }
+
+            row.addEventListener('click', () => {
+                _hideMenu();
+                _dismissToast();
+                start(p.id);
+            });
+
+            _menuPopover.appendChild(row);
         });
-        container.appendChild(btn);
+    }
 
-        if (!hasSeen(pluginId) && !hasDismissed(pluginId)) {
-            _showPrompt(pluginId, container, btn, opts);
+    function _updateMenuVisibility() {
+        if (!_menuBtn) return;
+        const plugins = _relevantPlugins(_currentScreenId);
+        _menuBtn.style.display = plugins.length ? '' : 'none';
+        if (!plugins.length) {
+            _hideMenu();
+            // Toast is position:fixed anchored to the now-hidden button
+            // — left visible it'd float in dead space. Dismiss it too.
+            _dismissToast();
+        } else if (_menuPopover && _menuPopover.style.display !== 'none') {
+            // Popover is currently open — rebuild rows so NEW/✓ badges,
+            // newly registered plugins, and reset state all reflect
+            // immediately rather than waiting for a close-and-reopen.
+            _rebuildMenuItems();
+        }
+
+        // Unseen indicator on the menu button itself.
+        if (_unseenRelevant(_currentScreenId).length) {
+            _menuBtn.classList.add('has-unseen');
+        } else {
+            _menuBtn.classList.remove('has-unseen');
         }
     }
 
-    function _removePrompt(pluginId, container) {
-        for (const el of container.querySelectorAll('.slopsmith-tour-prompt')) {
-            if (el.dataset.pluginId === pluginId) { el.remove(); break; }
-        }
+    // ── First-visit toast ─────────────────────────────────────────────────
+
+    function _dismissToast() {
+        if (!_activeToastPluginId) return;
+        const id = _activeToastPluginId;
+        _activeToastPluginId = null;
+        document.querySelectorAll('.slopsmith-tour-prompt').forEach(el => {
+            if (el.dataset.pluginId === id) {
+                el.classList.add('fading');
+                setTimeout(() => el.remove(), 500);
+            }
+        });
     }
 
-    function _showPrompt(pluginId, container, triggerBtn, opts) {
-        opts = opts || {};
-        const pluginName = _tourPlugins[pluginId] ? _tourPlugins[pluginId].name : pluginId;
+    function _maybeShowToast() {
+        if (_activeToastPluginId) return; // already prompting
+        // Don't pop a toast on top of an active tour either — song:ready
+        // can fire mid-tour (user loads a new song while taking the tour)
+        // and we don't want a "Take a quick tour of X?" prompt overlapping
+        // the Shepherd UI for an unrelated plugin.
+        if (_activeTour) return;
+        if (!_menuBtn || _menuBtn.style.display === 'none') return;
+        // Don't visually overlap the popover the user already opened —
+        // the toast and the popover share the same screen anchor and
+        // would steal attention from each other mid-interaction.
+        if (_menuPopover && _menuPopover.style.display !== 'none') return;
+
+        const unseen = _unseenRelevant(_currentScreenId);
+        if (!unseen.length) return;
+        const plugin = unseen[0];
 
         const prompt = document.createElement('div');
-        prompt.className = 'slopsmith-tour-prompt' + (opts.bottom ? ' position-bottom' : '');
-        prompt.dataset.pluginId = pluginId;
-        const promptText = document.createElement('span');
-        promptText.textContent = 'Take a quick tour of ';
+        prompt.className = 'slopsmith-tour-prompt';
+        prompt.dataset.pluginId = plugin.id;
+        const text = document.createElement('span');
+        text.textContent = 'Take a quick tour of ';
         const bold = document.createElement('b');
-        bold.textContent = pluginName;
-        const promptSuffix = document.createTextNode('?');
-        prompt.appendChild(promptText);
+        bold.textContent = plugin.name || plugin.id;
+        prompt.appendChild(text);
         prompt.appendChild(bold);
-        prompt.appendChild(promptSuffix);
+        prompt.appendChild(document.createTextNode('?'));
+
+        if (unseen.length > 1) {
+            const more = document.createElement('div');
+            more.className = 'tour-prompt-more';
+            more.textContent = '+ ' + (unseen.length - 1) + ' more available';
+            prompt.appendChild(more);
+        }
 
         const btns = document.createElement('div');
         btns.className = 'tour-prompt-buttons';
@@ -105,34 +353,41 @@
         yesBtn.dataset.action = 'start';
         yesBtn.textContent = 'Yes';
         yesBtn.addEventListener('click', async () => {
+            _activeToastPluginId = null;
             prompt.remove();
-            const started = await start(pluginId);
-            if (started === true) {
-                _markDismissed(pluginId);
-            }
+            // Hand persistence off to start() — its Shepherd handlers
+            // mark seen on complete / dismissed on cancel. Marking
+            // dismissed here would flip hasDismissed() to true while
+            // the tour is still running, even after a successful
+            // completion, suppressing the NEW state semantics.
+            await start(plugin.id);
         });
 
         const noBtn = document.createElement('button');
         noBtn.dataset.action = 'dismiss';
         noBtn.textContent = 'Not now';
         noBtn.addEventListener('click', () => {
-            _markDismissed(pluginId);
+            _activeToastPluginId = null;
+            _markDismissed(plugin.id);
             prompt.classList.add('fading');
             setTimeout(() => prompt.remove(), 500);
-            if (triggerBtn) triggerBtn.classList.remove('first-visit');
+            _updateMenuVisibility();
         });
 
         btns.appendChild(yesBtn);
         btns.appendChild(noBtn);
         prompt.appendChild(btns);
-        container.appendChild(prompt);
+        document.body.appendChild(prompt);
+        _activeToastPluginId = plugin.id;
 
-        // Auto-dismiss after 8 s
+        // Auto-dismiss after 8 s.
         const timer = setTimeout(() => {
-            _markDismissed(pluginId);
+            if (_activeToastPluginId !== plugin.id) return;
+            _activeToastPluginId = null;
+            _markDismissed(plugin.id);
             prompt.classList.add('fading');
             setTimeout(() => prompt.remove(), 500);
-            if (triggerBtn) triggerBtn.classList.remove('first-visit');
+            _updateMenuVisibility();
         }, 8000);
 
         const obs = new MutationObserver(() => {
@@ -141,7 +396,7 @@
         obs.observe(document.body, { childList: true, subtree: true });
     }
 
-    // ── Step loading ──────────────────────────────────────────────────────
+    // ── Step loading + Shepherd start ─────────────────────────────────────
 
     async function _loadSteps(pluginId) {
         if (_registry[pluginId] && typeof _registry[pluginId].buildSteps === 'function') {
@@ -163,12 +418,20 @@
         }
     }
 
-    // ── Shepherd step mapping ─────────────────────────────────────────────
+    // HTML-escape strings before handing them to Shepherd as a `title`,
+    // since Shepherd renders titles via innerHTML. Plugin authors control
+    // tour.json content but defense in depth is cheap: a typo with an
+    // unescaped `&` or `<` in a title would otherwise silently corrupt
+    // the rendered header, and a malicious / compromised plugin can't
+    // inject markup or script tags via this surface.
+    const _WAIT_FOR_TIMEOUT_MS = 5000;
+    const _ESC_MAP = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
+    function esc(s) {
+        return String(s).replace(/[&<>"']/g, c => _ESC_MAP[c]);
+    }
 
     function _mapSteps(rawSteps, tourInstance) {
         return rawSteps.map(raw => {
-            // Pass title as a plain string (Shepherd renders it with innerHTML).
-            // Keep text as a DOM node so tour.json content is never executed as HTML.
             const textEl = document.createElement('p');
             textEl.textContent = raw.content || '';
 
@@ -185,6 +448,43 @@
 
             if (raw.selector) {
                 opts.attachTo = { element: raw.selector, on: raw.position || 'bottom' };
+            }
+
+            // waitFor lets a step block until its required DOM is in the
+            // page. Useful when the consolidated menu can launch a tour
+            // before the plugin's UI is fully mounted (e.g. 3D Highway's
+            // .h3d-wrap appears after the first frame, but the user can
+            // click "Take tour" before then). Polls with rAF up to
+            // _WAIT_FOR_TIMEOUT_MS; resolves either way so the tour
+            // doesn't hang — a still-missing selector will fail open at
+            // attachTo and Shepherd will fall back to a centered tip.
+            if (typeof raw.waitFor === 'string' && raw.waitFor) {
+                const sel = raw.waitFor;
+                // Try once up front so an invalid selector logs + resolves
+                // immediately rather than hammering rAF and re-throwing
+                // every frame.
+                let selectorOk = true;
+                try { document.querySelector(sel); }
+                catch (e) {
+                    selectorOk = false;
+                    console.warn('[slopsmithTour] step', raw.id, 'waitFor selector is invalid:', sel, e);
+                }
+                if (selectorOk) {
+                    opts.beforeShowPromise = () => new Promise(resolve => {
+                        const start = performance.now();
+                        const tick = () => {
+                            let found = false;
+                            try { found = !!document.querySelector(sel); }
+                            catch { return resolve(); } // selector became invalid mid-poll
+                            if (found || performance.now() - start > _WAIT_FOR_TIMEOUT_MS) {
+                                resolve();
+                            } else {
+                                requestAnimationFrame(tick);
+                            }
+                        };
+                        tick();
+                    });
+                }
             }
 
             if (raw.shape === 'label') {
@@ -211,8 +511,6 @@
             return opts;
         });
     }
-
-    // ── Start / cancel tour ───────────────────────────────────────────────
 
     async function start(pluginId) {
         if (typeof window.Shepherd === 'undefined' || !window.Shepherd.Tour) {
@@ -244,20 +542,23 @@
         const mappedSteps = _mapSteps(rawSteps, tour);
         mappedSteps.forEach(s => tour.addStep(s));
 
+        // Reset live state regardless of how the tour ended. Persistence
+        // (seen vs dismissed) is decided by the handlers below — completing
+        // the tour earns the ✓ badge, cancelling out mid-flight is treated
+        // the same as the "Not now" toast (dismissed, no badge).
+        const resetActive = () => {
+            _activeTour = null;
+            _activeTourPluginId = null;
+            _updateMenuVisibility();
+        };
         tour.on('complete', () => {
             _markSeen(pluginId);
+            resetActive();
             _registry[pluginId]?.onComplete?.();
-            _activeTour = null;
-            _activeTourPluginId = null;
-            document.querySelectorAll('.slopsmith-tour-trigger')
-                .forEach(b => { if (b.dataset.pluginId === pluginId) b.classList.remove('first-visit'); });
         });
         tour.on('cancel', () => {
-            _markSeen(pluginId);
-            _activeTour = null;
-            _activeTourPluginId = null;
-            document.querySelectorAll('.slopsmith-tour-trigger')
-                .forEach(b => { if (b.dataset.pluginId === pluginId) b.classList.remove('first-visit'); });
+            _markDismissed(pluginId);
+            resetActive();
         });
 
         _activeTour = tour;
@@ -272,110 +573,51 @@
     function _onScreenChanged(ev) {
         const screenId = ev.detail && ev.detail.id;
         if (!screenId) return;
+        _currentScreenId = screenId;
 
-        // Cancel active tour if user navigated away
         if (_activeTour && _activeTourPluginId) {
-            const p = _tourPlugins[_activeTourPluginId];
-            const expectedScreen = p && !p.has_screen ? 'player' : ('plugin-' + _activeTourPluginId);
-            if (screenId !== expectedScreen) {
+            const screens = _screensFor(_activeTourPluginId);
+            if (screens.indexOf(screenId) === -1) {
                 _activeTour.cancel();
                 _activeTour = null;
                 _activeTourPluginId = null;
             }
         }
 
-        // Auto-inject for plugins with dedicated screen divs
-        if (screenId.startsWith('plugin-')) {
-            const pluginId = screenId.slice(7);
-            if (_tourPlugins[pluginId]) {
-                injectTrigger(pluginId, document.getElementById(screenId));
-            }
-        }
+        // Closing the toast on screen change — its anchor is the menu button,
+        // and the menu may be hidden / repopulated on the new screen.
+        _dismissToast();
 
-        // Auto-inject for viz plugins (no dedicated screen) when player activates.
-        // Only inject for the currently selected viz plugin — injecting for all
-        // tour-enabled viz plugins would stack multiple absolutely-positioned
-        // buttons at the same coordinates when more than one is installed.
-        if (screenId === 'player') {
-            _injectPlayerVizTrigger();
-        }
-    }
-
-    function _currentVizPluginId() {
-        // Returns the viz plugin ID that is currently active.
-        // For an explicit pick (not 'auto' or 'default'), returns it directly.
-        // For 'auto' mode, evaluates each tour-enabled viz plugin's
-        // matchesArrangement() predicate — mirroring _autoMatchViz() in app.js —
-        // and returns the first match, or null when nothing matches.
-        let sel = null;
-        try { sel = localStorage.getItem('vizSelection'); } catch { /* private mode */ }
-        if (!sel) {
-            const picker = document.getElementById('viz-picker');
-            if (picker) sel = picker.value;
-        }
-        if (sel && sel !== 'auto' && sel !== 'default') return sel;
-
-        if (sel === 'auto') {
-            const songInfo = (typeof highway !== 'undefined' && typeof highway.getSongInfo === 'function')
-                ? (highway.getSongInfo() || {}) : {};
-            // Mirror _autoMatchViz() in app.js: iterate #viz-picker options in DOM
-            // order so the first match is the same plugin the picker would activate.
-            const picker = document.getElementById('viz-picker');
-            const candidateIds = picker
-                ? Array.from(picker.options).map(o => o.value).filter(v => v !== 'auto' && v !== 'default')
-                : Object.keys(_tourPlugins).filter(id => !_tourPlugins[id].has_screen);
-            for (const pluginId of candidateIds) {
-                if (!_tourPlugins[pluginId]) continue; // not a tour-enabled plugin
-                const p = _tourPlugins[pluginId];
-                if (p.has_screen) continue; // dedicated-screen plugins aren't viz plugins
-                const factory = window['slopsmithViz_' + pluginId];
-                if (typeof factory !== 'function') continue;
-                const predicate = factory.matchesArrangement;
-                if (typeof predicate !== 'function') continue;
-                try { if (predicate(songInfo)) return pluginId; } catch { /* ignore */ }
-            }
-        }
-        return null;
-    }
-
-    function _injectPlayerVizTrigger() {
-        const player = document.getElementById('player');
-        if (!player) return;
-        const vizId = _currentVizPluginId();
-
-        // Remove any player viz triggers that don't match the newly active plugin
-        // (handles auto-mode switching between songs).
-        player.querySelectorAll('.slopsmith-tour-trigger').forEach(btn => {
-            if (btn.dataset.pluginId !== vizId) {
-                for (const el of player.querySelectorAll('.slopsmith-tour-prompt')) {
-                    if (el.dataset.pluginId === btn.dataset.pluginId) { el.remove(); break; }
-                }
-                btn.remove();
-            }
-        });
-
-        if (!vizId) return;
-        const p = _tourPlugins[vizId];
-        if (p && !p.has_screen) {
-            injectTrigger(p.id, '#player', { bottom: true });
-        }
+        _updateMenuVisibility();
+        _maybeShowToast();
     }
 
     // ── Public API ────────────────────────────────────────────────────────
 
     function register(pluginId, opts) {
         opts = opts || {};
+        // injectTriggerInto / injectTriggerOpts are dropped — the consolidated
+        // menu owns trigger placement. Warn once per plugin id so out-of-tree
+        // plugins still calling with those options get the deprecation signal
+        // without spamming the console on every reload / re-register.
+        if (('injectTriggerInto' in opts || 'injectTriggerOpts' in opts) &&
+            !_deprecationWarned.has(pluginId)) {
+            _deprecationWarned.add(pluginId);
+            console.warn(
+                '[slopsmithTour] register(' + JSON.stringify(pluginId) + '): ' +
+                'injectTriggerInto / injectTriggerOpts are no longer honored — ' +
+                'the consolidated tour menu (slopsmith#272) manages the ? button ' +
+                'for every plugin. Remove these options from your register() call.'
+            );
+        }
         _registry[pluginId] = {
             buildSteps: opts.buildSteps || null,
             onStart: opts.onStart || null,
             onComplete: opts.onComplete || null,
+            screens: Array.isArray(opts.screens) ? opts.screens.slice() : null,
         };
-        // injectTriggerInto is now optional — the engine handles viz plugins
-        // autonomously via screen:changed. This hook remains for plugins that
-        // want a custom container outside the normal flow.
-        if (opts.injectTriggerInto && opts.injectTriggerInto !== '#player') {
-            requestAnimationFrame(() => injectTrigger(pluginId, opts.injectTriggerInto));
-        }
+        // If the override changes the relevance for the current screen, refresh.
+        _updateMenuVisibility();
     }
 
     function reset(pluginId) {
@@ -384,8 +626,6 @@
                 localStorage.removeItem(_seenKey(pluginId));
                 localStorage.removeItem(_dismissedKey(pluginId));
             } else {
-                // Collect keys first (localStorage.key(i) is the portable API),
-                // then remove — avoids mutation during enumeration.
                 const toRemove = [];
                 for (let i = 0; i < localStorage.length; i++) {
                     const k = localStorage.key(i);
@@ -394,6 +634,7 @@
                 toRemove.forEach(k => localStorage.removeItem(k));
             }
         } catch { /* private mode — ignore */ }
+        _updateMenuVisibility();
     }
 
     window.slopsmithTour = { register, start, hasSeen, hasDismissed, reset };
@@ -415,27 +656,35 @@
             if (!resp.ok) return;
             const plugins = await resp.json();
             plugins.filter(p => p.has_tour).forEach(p => {
-                _tourPlugins[p.id] = { id: p.id, name: p.name, has_screen: p.has_screen };
+                _tourPlugins[p.id] = {
+                    id: p.id,
+                    name: p.name,
+                    has_screen: p.has_screen,
+                    is_viz: p.type === 'visualization',
+                };
             });
         } catch (e) {
             console.warn('[slopsmithTour] Failed to load plugin list:', e);
             return;
         }
 
+        _ensureMenu();
         window.slopsmith.on('screen:changed', _onScreenChanged);
-
-        // In auto-viz mode, matchesArrangement() is only meaningful once a song
-        // is loaded (getSongInfo() returns {}  before that). Re-run trigger
-        // injection on song:ready so the ? button appears for the auto-matched viz.
+        // song:ready can change the auto-mode viz match without a screen
+        // change — re-evaluate relevance so the menu picks up the new
+        // active viz on the next song load.
         window.slopsmith.on('song:ready', () => {
-            if (document.getElementById('player')?.classList.contains('active')) {
-                _injectPlayerVizTrigger();
-            }
+            _dismissToast();
+            _updateMenuVisibility();
+            _maybeShowToast();
         });
 
-        // If the player screen is already active on load (e.g., deep-link), inject now
-        if (document.getElementById('player')?.classList.contains('active')) {
-            _injectPlayerVizTrigger();
+        // Initial pass: find the currently active screen, prime state.
+        const screens = document.querySelectorAll('.screen.active');
+        if (screens.length) {
+            _currentScreenId = screens[0].id;
         }
+        _updateMenuVisibility();
+        _maybeShowToast();
     });
 })();

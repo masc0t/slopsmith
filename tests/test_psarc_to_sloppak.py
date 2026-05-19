@@ -262,3 +262,201 @@ def test_progress_callback_terminates_at_done(tmp_path: Path, monkeypatch):
     assert "extracting" in stages
     assert "packing" in stages
     assert stages.index("extracting") < stages.index("packing") < stages.index("done")
+
+
+# ── Atomic-write contract (issue topkoa/slopsmith-plugin-sloppak-converter#25) ─
+
+
+def test_zip_write_is_atomic_no_tmp_sibling_after_success(tmp_path: Path, monkeypatch):
+    """Happy path: a finished convert leaves only `out.sloppak`, no
+    half-written `.tmp` sibling. Guards against accidentally bypassing
+    the rename step in future refactors."""
+    _require_fixture()
+    _apply_pony_stubs(monkeypatch)
+    out = tmp_path / "out.sloppak"
+    convert_psarc_to_sloppak(FIXTURE, out)
+    siblings = sorted(p.name for p in tmp_path.iterdir())
+    assert siblings == ["out.sloppak"], (
+        f"expected only the final sloppak in the output dir, got {siblings}"
+    )
+
+
+def test_zip_write_failure_does_not_clobber_existing_out_path(tmp_path: Path, monkeypatch):
+    """A pre-existing sloppak at `out_path` must be preserved verbatim
+    when a conversion fails mid-write. Without the atomic `.tmp` +
+    rename pattern, the previous direct-write path could leave a
+    partial / truncated zip on top of the user's existing file."""
+    _require_fixture()
+    _apply_pony_stubs(monkeypatch)
+
+    out = tmp_path / "existing.sloppak"
+    sentinel = b"PRE-EXISTING-CONTENT" + b"\x00" * 128
+    out.write_bytes(sentinel)
+
+    # Force the zip step to blow up after extraction completes.
+    def _explode(*args, **kwargs):
+        raise RuntimeError("simulated mid-write crash")
+    monkeypatch.setattr(sloppak_convert, "_zip_dir", _explode)
+
+    with pytest.raises(RuntimeError, match="simulated mid-write crash"):
+        convert_psarc_to_sloppak(FIXTURE, out)
+
+    # Existing file untouched.
+    assert out.read_bytes() == sentinel
+    # No leftover `.tmp` staging file.
+    assert not (tmp_path / "existing.sloppak.tmp").exists()
+
+
+def test_dir_write_failure_does_not_clobber_existing_out_dir(tmp_path: Path, monkeypatch):
+    """Same contract for the `as_dir=True` path: pre-existing dir-form
+    sloppak survives a failed convert. The two-rename swap pattern
+    bounds the window to a single rename rather than the rmtree +
+    copytree the previous code did."""
+    _require_fixture()
+    _apply_pony_stubs(monkeypatch)
+
+    out = tmp_path / "existing.sloppak"
+    out.mkdir()
+    (out / "sentinel.txt").write_text("untouched", encoding="utf-8")
+
+    # `as_dir=True` uses `shutil.copytree` to stage at `.tmp`. Make
+    # the copytree raise to simulate a kill mid-stage. Patching the
+    # symbol on the module under test (sloppak_convert.shutil) so the
+    # production code path sees the explosion.
+    def _explode(*args, **kwargs):
+        raise RuntimeError("simulated mid-write crash (dir form)")
+    monkeypatch.setattr(sloppak_convert.shutil, "copytree", _explode)
+
+    with pytest.raises(RuntimeError, match="simulated mid-write crash"):
+        convert_psarc_to_sloppak(FIXTURE, out, as_dir=True)
+
+    # Existing dir preserved with its sentinel content.
+    assert (out / "sentinel.txt").read_text(encoding="utf-8") == "untouched"
+    # No leftover `.tmp` staging dir, no `.old` backup left lying around.
+    assert not (tmp_path / "existing.sloppak.tmp").exists()
+    assert not (tmp_path / "existing.sloppak.old").exists()
+
+
+def test_zip_convert_cleans_stale_dir_form_tmp(tmp_path: Path, monkeypatch):
+    """A leftover `.tmp` directory from a previously-killed `as_dir=True`
+    convert must not block a fresh `as_dir=False` convert from staging
+    its zip at the same `.tmp` path."""
+    _require_fixture()
+    _apply_pony_stubs(monkeypatch)
+
+    out = tmp_path / "out.sloppak"
+    stale = tmp_path / "out.sloppak.tmp"
+    stale.mkdir()
+    (stale / "from-prior-dir-convert.txt").write_text("ghost")
+
+    convert_psarc_to_sloppak(FIXTURE, out)
+
+    assert out.exists() and out.is_file()
+    assert not stale.exists()
+
+
+def test_dir_convert_cleans_stale_zip_form_tmp(tmp_path: Path, monkeypatch):
+    """Mirror case: a leftover `.tmp` *file* from a previously-killed
+    `as_dir=False` convert must not block a fresh `as_dir=True` convert."""
+    _require_fixture()
+    _apply_pony_stubs(monkeypatch)
+
+    out = tmp_path / "out.sloppak"
+    stale = tmp_path / "out.sloppak.tmp"
+    stale.write_bytes(b"ghost zip from prior crash")
+
+    convert_psarc_to_sloppak(FIXTURE, out, as_dir=True)
+
+    assert out.exists() and out.is_dir()
+    assert not stale.exists()
+
+
+def test_dir_convert_handles_pre_existing_file_at_out_path(tmp_path: Path, monkeypatch):
+    """User reconverts `as_dir=True` over an existing zip-form sloppak —
+    the file at `out_path` must be replaced atomically without leaving
+    a `.old` file sidecar."""
+    _require_fixture()
+    _apply_pony_stubs(monkeypatch)
+
+    out = tmp_path / "out.sloppak"
+    out.write_bytes(b"prior zip-form sloppak")
+
+    convert_psarc_to_sloppak(FIXTURE, out, as_dir=True)
+
+    assert out.exists() and out.is_dir()
+    assert not (tmp_path / "out.sloppak.tmp").exists()
+    assert not (tmp_path / "out.sloppak.old").exists()
+
+
+def test_dir_convert_cleans_stale_file_backup(tmp_path: Path, monkeypatch):
+    """A pre-existing `<out>.sloppak.old` *file* (e.g. left behind from
+    a kill during a prior `as_dir=True` swap when out_path was a zip-
+    form sloppak) must not crash the next convert with
+    `NotADirectoryError`."""
+    _require_fixture()
+    _apply_pony_stubs(monkeypatch)
+
+    out = tmp_path / "out.sloppak"
+    stale_backup = tmp_path / "out.sloppak.old"
+    stale_backup.write_bytes(b"ghost zip from interrupted swap")
+
+    convert_psarc_to_sloppak(FIXTURE, out, as_dir=True)
+
+    assert out.exists() and out.is_dir()
+    assert not stale_backup.exists()
+
+
+def test_zip_convert_handles_pre_existing_dir_at_out_path(tmp_path: Path, monkeypatch):
+    """User reconverts `as_dir=False` (zip form) over an existing dir-
+    form sloppak — `os.replace` can't swap file-onto-dir, so the dir
+    must be cleared first. Mirrors the as_dir=True branch's handling
+    of pre-existing file at out_path."""
+    _require_fixture()
+    _apply_pony_stubs(monkeypatch)
+
+    out = tmp_path / "out.sloppak"
+    out.mkdir()
+    (out / "from-prior-dir-convert.txt").write_text("ghost", encoding="utf-8")
+
+    convert_psarc_to_sloppak(FIXTURE, out)
+
+    assert out.exists() and out.is_file()
+    # No leftover staging file.
+    assert not (tmp_path / "out.sloppak.tmp").exists()
+
+
+def test_finally_cleans_old_sidecar_on_failed_swap_rename(tmp_path: Path, monkeypatch):
+    """Simulate a crash *after* `out_path.rename(backup)` succeeded but
+    *before* `tmp_out.rename(out_path)` did. The rollback path renames
+    `backup` back, but the `finally` is what guarantees no stale `.old`
+    survives if rollback itself stumbles."""
+    _require_fixture()
+    _apply_pony_stubs(monkeypatch)
+
+    out = tmp_path / "out.sloppak"
+    out.mkdir()
+    (out / "sentinel.txt").write_text("from-original", encoding="utf-8")
+
+    # Make the *second* Path.rename call fail (the first is
+    # `out_path.rename(backup)`; the second is `tmp_out.rename(out_path)`).
+    original_rename = Path.rename
+    call_count = [0]
+
+    def _flaky_rename(self, target):
+        call_count[0] += 1
+        if call_count[0] == 2:
+            raise RuntimeError("simulated rename failure mid-swap")
+        return original_rename(self, target)
+
+    monkeypatch.setattr(Path, "rename", _flaky_rename)
+
+    with pytest.raises(RuntimeError, match="simulated rename failure mid-swap"):
+        convert_psarc_to_sloppak(FIXTURE, out, as_dir=True)
+
+    # Rollback restored the original dir.
+    assert out.exists() and out.is_dir()
+    assert (out / "sentinel.txt").read_text(encoding="utf-8") == "from-original"
+    # `.old` swept up by the finally.
+    assert not (tmp_path / "out.sloppak.old").exists()
+    # `.tmp` swept up by the finally.
+    assert not (tmp_path / "out.sloppak.tmp").exists()

@@ -1,0 +1,68 @@
+{
+    "version": 1,
+    "tour": [
+        {
+            "id": "welcome",
+            "title": "Welcome to Slopsmith",
+            "content": "This is your library — every PSARC and sloppak we found in your DLC folder. Let's take a quick spin through the controls.",
+            "shape": "bubble",
+            "position": "auto"
+        },
+        {
+            "id": "search",
+            "selector": "#lib-filter",
+            "title": "Search",
+            "content": "Filter the library by title, artist, or album. Matches as you type.",
+            "shape": "spotlight",
+            "position": "bottom"
+        },
+        {
+            "id": "sort",
+            "selector": "#lib-sort",
+            "title": "Sort",
+            "content": "Sort by recent, artist, title, year, or tuning. \"Recent\" surfaces whatever you've played or added lately.",
+            "shape": "spotlight",
+            "position": "bottom"
+        },
+        {
+            "id": "format-filter",
+            "selector": "#lib-format",
+            "title": "Format filter",
+            "content": "Narrow the list by source format — PSARC (Rocksmith CDLC), sloppak (open format), or folder imports.",
+            "shape": "spotlight",
+            "position": "bottom"
+        },
+        {
+            "id": "views",
+            "selector": "#view-tree-btn",
+            "title": "Grid or tree view",
+            "content": "Toggle between grid (album-art cards) and tree (artist → album) views. Tree view shows Expand All / Collapse All buttons next to it.",
+            "shape": "spotlight",
+            "position": "bottom"
+        },
+        {
+            "id": "filters-drawer",
+            "selector": "#btn-lib-filters",
+            "title": "Advanced filters",
+            "content": "Filter by arrangement (Lead/Rhythm/Bass), stems availability, lyrics, or tuning. Active filters appear as chips below the search box.",
+            "shape": "spotlight",
+            "position": "bottom"
+        },
+        {
+            "id": "song-card",
+            "selector": ".song-card",
+            "title": "Play a song",
+            "content": "Click any card to start playing. The ★ marks it as a favorite — your favorites get their own screen in the navbar.",
+            "shape": "spotlight",
+            "position": "auto",
+            "waitFor": ".song-card"
+        },
+        {
+            "id": "outro",
+            "title": "That's the tour",
+            "content": "The floating ? button (bottom-right) brings this back any time, plus any plugin tours relevant to the current screen.",
+            "shape": "bubble",
+            "position": "auto"
+        }
+    ]
+}

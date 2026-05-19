@@ -15,6 +15,10 @@ plugins/*/
 !plugins/highway_3d/
 !plugins/highway_3d/**
 plugins/highway_3d/__pycache__/
+!plugins/app_tour_library/
+!plugins/app_tour_library/**
+!plugins/app_tour_settings/
+!plugins/app_tour_settings/**
 node_modules/
 test-results/
 playwright-report/

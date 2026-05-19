@@ -39,6 +39,10 @@ function buildClockSandbox(perfNowImpl) {
         chartTime: 0,
         currentTime: 0,
         avOffsetSec: 0,
+        // Per-song chart offset (loose-folder format only). Tests pin
+        // this at 0 so the clock-behaviour assertions can stay
+        // expressed in raw audio time without offset bookkeeping.
+        songOffset: 0,
         // Match production: NaN sentinels for "no prior anchor" so
         // the first setTime call always re-anchors (even setTime(0))
         // and so getTime() before any setTime returns chartTime.

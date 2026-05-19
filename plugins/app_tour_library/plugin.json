@@ -1,0 +1,8 @@
+{
+    "id": "app_tour_library",
+    "name": "Library Tour",
+    "version": "1.0.0",
+    "bundled": true,
+    "script": "script.js",
+    "tour": "tour.json"
+}

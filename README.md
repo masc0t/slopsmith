@@ -41,6 +41,7 @@ A real-time note highway that renders Rocksmith arrangements as they would appea
 - Slides (diagonal arrow)
 - Hammer-ons / Pull-offs / Taps (H/P/T labels)
 - Palm mutes (PM label)
+- Vibrato (animated sustain)
 - Tremolo (wavy line)
 - Accents (> marker)
 - Harmonics (diamond shape)
@@ -152,6 +153,45 @@ services:
 volumes:
   slopsmith-config:
 ```
+## Apache Reverse Proxy
+
+To expose Slopsmith behind an Apache reverse proxy, add the following configuration to your virtual host:
+
+```apache
+ProxyPass /slopsmith/ http://localhost:8000/
+ProxyPassReverse /slopsmith/ http://localhost:8000/
+
+ProxyPass /api/ http://localhost:8000/api/
+ProxyPassReverse /api/ http://localhost:8000/api/
+
+ProxyPass /static/ http://localhost:8000/static/
+ProxyPassReverse /static/ http://localhost:8000/static/
+
+ProxyPass /ws ws://localhost:8000/ws
+
+ProxyPass /audio/ http://localhost:8000/audio/
+ProxyPassReverse /audio/ http://localhost:8000/audio/
+```
+
+Ensure the required Apache modules are enabled:
+
+```bash
+sudo a2enmod proxy
+sudo a2enmod proxy_http
+sudo a2enmod proxy_wstunnel
+```
+
+Then restart Apache:
+
+```bash
+sudo systemctl restart apache2
+```
+
+> **Note:** If Slopsmith is running on a different server, replace `localhost:8000` with the appropriate URL or IP address (e.g., `http://192.168.1.100:8000` or `http://slopsmith.internal:8000`).
+>
+> **Important:** Even though the app entrypoint is proxied at `/slopsmith`, Slopsmith currently uses absolute frontend paths (for example `/static/...` and `/api/...`). That is why the config also proxies `/api`, `/static`, `/ws`, and `/audio` at the virtual-host root. These root routes will be exposed and can conflict with an existing site that already uses the same paths.
+>
+> Slopsmith is not fully base-path aware yet, so it cannot be cleanly nested entirely under `/slopsmith` without additional rewriting or app changes. If you need to avoid route collisions, use a dedicated subdomain (for example `slopsmith.your-domain`) as the cleanest option.
 
 <<<<<<< HEAD
 ## Apache Reverse Proxy
@@ -223,6 +263,82 @@ sudo env SKIP_HASH_CHECK=1 bash build-proxmox-ct.sh amd64 slopsmith-ct
 ```
 
 The script is linted with `shellcheck`. Only `amd64` is supported out of the box; `arm64` requires `qemu-user-static` + binfmt registration.
+
+## Portainer Setup
+
+This guide walks through installing Docker, Portainer, and Slopsmith on Ubuntu.
+
+**Step 1:** Update Package Lists & install docker
+```bash
+sudo apt update
+sudo apt install docker.io -y
+sudo usermod -aG docker $USER
+```
+**Step 2:** Install Portainer on Ubuntu
+```bash
+sudo docker pull portainer/portainer-ce:latest
+sudo docker run -d -p 9000:9000 --restart always -v /var/run/docker.sock:/var/run/docker.sock portainer/portainer-ce:latest
+```
+**Step 3:** Access the Portainer Web Interface
+Open the following URL in your browser:
+
+    • http://server-ip:9000
+
+**Step 4:** Pull the Slopsmith Image
+In Portainer, go to the Images tab and build a new image using the following settings:
+
+    • Image Name: slopsmith:latest
+    
+    • Repository URL: https://github.com/byrongamatos/slopsmith.git
+
+**Step 5:** Create a Stack for Slopsmith
+Click '+ Add Stack' and paste the following Docker Compose configuration into the editor. Replace '/path/to/dlc/' with the correct path where your dlc is on your host system.
+```bash
+version: "3.9"
+
+services:
+  web:
+    image: slopsmith:latest
+    container_name: slopsmith-web
+    restart: unless-stopped
+
+    ports:
+      - "7000:8000"
+
+    volumes:
+      - /path/to/dlc/:/dlc
+      - slopsmith-config:/config
+
+    environment:
+      DLC_DIR: /dlc
+      CONFIG_DIR: /config
+
+volumes
+  slopsmith-config:
+```
+Click 'Deploy the stack'. This creates a container named 'slopsmith-web'.
+Access Slopsmith at: http://server-ip:7000
+
+**Step 6:** Add the Update Manager
+
+Clone the Update Manager repository on the host machine and copy to container.
+```bash
+cd /home/your_user
+git clone https://github.com/byrongamatos/slopsmith-update-manager.git update_manager
+sudo docker cp /home/your_user/update_manager slopsmith-web:/app/plugins/
+```
+**Step 7:** Restart the Slopsmith Container
+
+In the Portainer web interface, go to Containers, select 'slopsmith-web', and restart the container.
+
+**Step 8:** Install Recommended Plugins
+
+Open Slopsmith at http://server-ip:7000 and install the following recommended plugins via the update manager:
+
+    • NAM Tone Engine - Enables Slopsmith to interface with your guitar/audio cable.
+        1. Download amp models and cabinet IRs from: https://www.tone3000.com/
+        
+    • Note Detection - Allows Slopsmith to detect the notes you are playing.
 
 ## Windows 11 install tutorial
 
@@ -305,40 +421,42 @@ Routes are registered under `/api/plugins/{plugin_id}/` to avoid conflicts.
 
 ### Available Plugins
 
-| Plugin | Description | Install |
-|--------|-------------|---------|
-| [Create from Tab](https://github.com/byrongamatos/slopsmith-plugin-ug) | Search Ultimate Guitar for GP tabs and convert to playable CDLC | `git clone ...slopsmith-plugin-ug.git ultimate_guitar` |
-| [Import Tab](https://github.com/byrongamatos/slopsmith-plugin-tabimport) | Drag and drop Guitar Pro files to create CDLC | `git clone ...slopsmith-plugin-tabimport.git tab_import` |
-| [Practice Journal](https://github.com/byrongamatos/slopsmith-plugin-practice) | Auto-track practice time, speed, loops. Dashboard with charts | `git clone ...slopsmith-plugin-practice.git practice_journal` |
-| [Setlist Builder](https://github.com/byrongamatos/slopsmith-plugin-setlist) | Create ordered playlists with sequential playback | `git clone ...slopsmith-plugin-setlist.git setlist` |
-| [Metronome](https://github.com/byrongamatos/slopsmith-plugin-metronome) | Audible click and visual beat flash synced to song tempo | `git clone ...slopsmith-plugin-metronome.git metronome` |
-| [Tone Player](https://github.com/byrongamatos/slopsmith-plugin-tones) | View amp/pedal/cab signal chains with Rocksmith gear artwork | `git clone ...slopsmith-plugin-tones.git tones` |
-| [Fretboard View](https://github.com/byrongamatos/slopsmith-plugin-fretboard) | Live fretboard overlay showing active notes in real-time | `git clone ...slopsmith-plugin-fretboard.git fretboard` |
-| [Tab View](https://github.com/byrongamatos/slopsmith-plugin-tabview) | Scrolling guitar tablature notation via alphaTab | `git clone ...slopsmith-plugin-tabview.git tab_view` |
-| [MIDI Amp Control](https://github.com/byrongamatos/slopsmith-plugin-midi) | Auto-switch amp/modeler presets via MIDI on tone changes | `git clone ...slopsmith-plugin-midi.git midi_amp` |
-| [Section Map](https://github.com/byrongamatos/slopsmith-plugin-sectionmap) | Color-coded song structure minimap with clickable navigation | `git clone ...slopsmith-plugin-sectionmap.git section_map` |
-| [RS1 Extractor](https://github.com/byrongamatos/slopsmith-plugin-rs1extract) | Extract RS1 compatibility songs into individual CDLCs | `git clone ...slopsmith-plugin-rs1extract.git rs1_extract` |
-| [Base Game Extractor](https://github.com/byrongamatos/slopsmith-plugin-discextract) | Extract on-disc base game songs from songs.psarc into individual CDLCs | `git clone ...slopsmith-plugin-discextract.git disc_extract` |
-| [Arrangement Editor](https://github.com/byrongamatos/slopsmith-plugin-editor) | DAW-like visual editor for creating and editing CDLC note charts | `git clone ...slopsmith-plugin-editor.git editor` |
-| [Profile Import](https://github.com/byrongamatos/slopsmith-plugin-profileimport) | Import play counts, favorites, and scores from Rocksmith profiles | `git clone ...slopsmith-plugin-profileimport.git profileimport` |
-| [MIDI Capo](https://github.com/masc0t/slopsmith-plugin-midi-capo) | MIDI capo control for real-time transposition | `git clone ...slopsmith-plugin-midi-capo.git midi_capo` |
-| [Note Detection](https://github.com/byrongamatos/slopsmith-plugin-notedetect) | Real-time pitch detection and scoring against highway notes | `git clone ...slopsmith-plugin-notedetect.git note_detect` |
-| [Find More CDLC](https://github.com/masc0t/slopsmith-plugin-find-more) | Search for more CDLC by the same artist | `git clone ...slopsmith-plugin-find-more.git find_more` |
-| [Piano Highway](https://github.com/byrongamatos/slopsmith-plugin-piano) | Scrolling piano/keyboard view for Keys arrangements with MIDI input | `git clone ...slopsmith-plugin-piano.git piano` |
-| [Studio](https://github.com/byrongamatos/slopsmith-plugin-studio) | Collaborative band recording and multi-track mixing | `git clone ...slopsmith-plugin-studio.git studio` |
-| [Drum Highway](https://github.com/byrongamatos/slopsmith-plugin-drums) | Lane-based drum highway with MIDI drum pad input and built-in sounds | `git clone ...slopsmith-plugin-drums.git drums` |
-| [Split Screen](https://github.com/topkoa/slopsmith-plugin-splitscreen) | 2-4 highway panels side-by-side for multi-arrangement practice | `git clone ...slopsmith-plugin-splitscreen.git splitscreen` |
-| [Sloppak Converter](https://github.com/topkoa/slopsmith-plugin-sloppak-converter) | Convert PSARC to .sloppak with Demucs stem splitting — bulk-select cards or one-click "convert all PSARCs missing a sloppak", with a Conversions queue dashboard (pause/resume, retry, per-job metadata + Demucs result summary) | `git clone ...slopsmith-plugin-sloppak-converter.git sloppak_converter` |
-| [Stems Mixer](https://github.com/topkoa/slopsmith-plugin-stems) | Per-stem mute/volume controls for .sloppak songs | `git clone ...slopsmith-plugin-stems.git stems` |
-| [Invert Highway](https://github.com/masc0t/slopsmith-plugin-invert-highway) | Flip the highway note direction | `git clone ...slopsmith-plugin-invert-highway.git invert_highway` |
-| [Jumping Tab](https://github.com/renanboni/slopsmith-plugin-jumpingtab) | Yousician-style 2D horizontal tab with trajectory arcs and hopping ball | `git clone ...slopsmith-plugin-jumpingtab.git jumpingtab` |
-| [Step Mode](https://github.com/byrongamatos/slopsmith-plugin-stepmode) | Rocksmith-1-style practice mode — highway freezes at each note until played (via Note Detection) or Space | `git clone ...slopsmith-plugin-stepmode.git step_mode` |
-| [Lyrics Sync](https://github.com/byrongamatos/slopsmith-plugin-lyrics-sync) | Generate synced LRC lyrics from text + vocals stem via Whisper alignment | `git clone ...slopsmith-plugin-lyrics-sync.git lyrics_sync` |
-| [NAM Tone Engine](https://github.com/byrongamatos/slopsmith-plugin-nam-tone) | In-browser amp modeling with NAM WASM, cabinet IRs, tone auto-switching | `git clone ...slopsmith-plugin-nam-tone.git nam_tone` |
-| [Guitar Theory Lab](https://github.com/topkoa/slopsmith-plugin-guitar-theory) | Explore scales, chords, intervals, tunings, and voicings on a fully interactive fretboard  | `git clone ...slopsmith-plugin-nam-tone.git guitar-theory-lab` |
-| [Themes](https://github.com/masc0t/slopsmith-plugin-themes) | Offers several basic recolorings of the interface  | `git clone ...slopsmith-plugin-themes.git themes` |
-| [Update Manager](https://github.com/masc0t/slopsmith-update-manager) | Installs, updates, and uninstalls other plugins and the slopsmith core itself   | `git clone ...slopsmith-update-manager.git update_manager` |
-| [Tuner](https://github.com/OmikronApex/slopsmith-plugin-tuner) | Floating tuner with customizable tunings   | `git clone ...slopsmith-plugin-tuner.git tuner` |
+| Plugin                                                                              | Description | Install                                                                 |
+|-------------------------------------------------------------------------------------|-------------|-------------------------------------------------------------------------|
+| [Create from Tab](https://github.com/byrongamatos/slopsmith-plugin-ug)              | Search Ultimate Guitar for GP tabs and convert to playable CDLC | `git clone ...slopsmith-plugin-ug.git ultimate_guitar`                  |
+| [Import Tab](https://github.com/byrongamatos/slopsmith-plugin-tabimport)            | Drag and drop Guitar Pro files to create CDLC | `git clone ...slopsmith-plugin-tabimport.git tab_import`                |
+| [Practice Journal](https://github.com/byrongamatos/slopsmith-plugin-practice)       | Auto-track practice time, speed, loops. Dashboard with charts | `git clone ...slopsmith-plugin-practice.git practice_journal`           |
+| [Setlist Builder](https://github.com/byrongamatos/slopsmith-plugin-setlist)         | Create ordered playlists with sequential playback | `git clone ...slopsmith-plugin-setlist.git setlist`                     |
+| [Metronome](https://github.com/byrongamatos/slopsmith-plugin-metronome)             | Audible click and visual beat flash synced to song tempo | `git clone ...slopsmith-plugin-metronome.git metronome`                 |
+| [Tone Player](https://github.com/byrongamatos/slopsmith-plugin-tones)               | View amp/pedal/cab signal chains with Rocksmith gear artwork | `git clone ...slopsmith-plugin-tones.git tones`                         |
+| [Fretboard View](https://github.com/byrongamatos/slopsmith-plugin-fretboard)        | Live fretboard overlay showing active notes in real-time | `git clone ...slopsmith-plugin-fretboard.git fretboard`                 |
+| [Tab View](https://github.com/byrongamatos/slopsmith-plugin-tabview)                | Scrolling guitar tablature notation via alphaTab | `git clone ...slopsmith-plugin-tabview.git tab_view`                    |
+| [MIDI Amp Control](https://github.com/byrongamatos/slopsmith-plugin-midi)           | Auto-switch amp/modeler presets via MIDI on tone changes | `git clone ...slopsmith-plugin-midi.git midi_amp`                       |
+| [Section Map](https://github.com/byrongamatos/slopsmith-plugin-sectionmap)          | Color-coded song structure minimap with clickable navigation | `git clone ...slopsmith-plugin-sectionmap.git section_map`              |
+| [RS1 Extractor](https://github.com/byrongamatos/slopsmith-plugin-rs1extract)        | Extract RS1 compatibility songs into individual CDLCs | `git clone ...slopsmith-plugin-rs1extract.git rs1_extract`              |
+| [Base Game Extractor](https://github.com/byrongamatos/slopsmith-plugin-discextract) | Extract on-disc base game songs from songs.psarc into individual CDLCs | `git clone ...slopsmith-plugin-discextract.git disc_extract`            |
+| [Arrangement Editor](https://github.com/byrongamatos/slopsmith-plugin-editor)       | DAW-like visual editor for creating and editing CDLC note charts | `git clone ...slopsmith-plugin-editor.git editor`                       |
+| [Profile Import](https://github.com/byrongamatos/slopsmith-plugin-profileimport)    | Import play counts, favorites, and scores from Rocksmith profiles | `git clone ...slopsmith-plugin-profileimport.git profileimport`         |
+| [MIDI Capo](https://github.com/masc0t/slopsmith-plugin-midi-capo)                   | MIDI capo control for real-time transposition | `git clone ...slopsmith-plugin-midi-capo.git midi_capo`                 |
+| [Note Detection](https://github.com/byrongamatos/slopsmith-plugin-notedetect)       | Real-time pitch detection and scoring against highway notes | `git clone ...slopsmith-plugin-notedetect.git note_detect`              |
+| [Find More CDLC](https://github.com/masc0t/slopsmith-plugin-find-more)              | Search for more CDLC by the same artist | `git clone ...slopsmith-plugin-find-more.git find_more`                 |
+| [Piano Highway](https://github.com/byrongamatos/slopsmith-plugin-piano)             | Scrolling piano/keyboard view for Keys arrangements with MIDI input | `git clone ...slopsmith-plugin-piano.git piano`                         |
+| [Studio](https://github.com/byrongamatos/slopsmith-plugin-studio)                   | Collaborative band recording and multi-track mixing | `git clone ...slopsmith-plugin-studio.git studio`                       |
+| [Drum Highway](https://github.com/byrongamatos/slopsmith-plugin-drums)              | Lane-based drum highway with MIDI drum pad input and built-in sounds | `git clone ...slopsmith-plugin-drums.git drums`                         |
+| [Split Screen](https://github.com/topkoa/slopsmith-plugin-splitscreen)              | 2-4 highway panels side-by-side for multi-arrangement practice | `git clone ...slopsmith-plugin-splitscreen.git splitscreen`             |
+| [Sloppak Converter](https://github.com/topkoa/slopsmith-plugin-sloppak-converter)   | Convert PSARC to .sloppak with Demucs stem splitting — bulk-select cards or one-click "convert all PSARCs missing a sloppak", with a Conversions queue dashboard (pause/resume, retry, per-job metadata + Demucs result summary) | `git clone ...slopsmith-plugin-sloppak-converter.git sloppak_converter` |
+| [Stems Mixer](https://github.com/topkoa/slopsmith-plugin-stems)                     | Per-stem mute/volume controls for .sloppak songs | `git clone ...slopsmith-plugin-stems.git stems`                         |
+| [Invert Highway](https://github.com/masc0t/slopsmith-plugin-invert-highway)         | Flip the highway note direction | `git clone ...slopsmith-plugin-invert-highway.git invert_highway`       |
+| [Jumping Tab](https://github.com/renanboni/slopsmith-plugin-jumpingtab)             | Yousician-style 2D horizontal tab with trajectory arcs and hopping ball | `git clone ...slopsmith-plugin-jumpingtab.git jumpingtab`               |
+| [Step Mode](https://github.com/byrongamatos/slopsmith-plugin-stepmode)              | Rocksmith-1-style practice mode — highway freezes at each note until played (via Note Detection) or Space | `git clone ...slopsmith-plugin-stepmode.git step_mode`                  |
+| [Lyrics Sync](https://github.com/byrongamatos/slopsmith-plugin-lyrics-sync)         | Generate synced LRC lyrics from text + vocals stem via Whisper alignment | `git clone ...slopsmith-plugin-lyrics-sync.git lyrics_sync`             |
+| [NAM Tone Engine](https://github.com/byrongamatos/slopsmith-plugin-nam-tone)        | In-browser amp modeling with NAM WASM, cabinet IRs, tone auto-switching | `git clone ...slopsmith-plugin-nam-tone.git nam_tone`                   |
+| [Guitar Theory Lab](https://github.com/topkoa/slopsmith-plugin-guitar-theory)       | Explore scales, chords, intervals, tunings, and voicings on a fully interactive fretboard  | `git clone ...slopsmith-plugin-nam-tone.git guitar-theory-lab`          |
+| [Themes](https://github.com/masc0t/slopsmith-plugin-themes)                         | Offers several basic recolorings of the interface  | `git clone ...slopsmith-plugin-themes.git themes`                       |
+| [Update Manager](https://github.com/masc0t/slopsmith-update-manager)                | Installs, updates, and uninstalls other plugins and the slopsmith core itself   | `git clone ...slopsmith-update-manager.git update_manager`              |
+| [Tuner](https://github.com/OmikronApex/slopsmith-plugin-tuner)                      | Floating tuner with customizable tunings   | `git clone ...slopsmith-plugin-tuner.git tuner`                         |
+| [Simplify Chords](https://github.com/bkranendonk/slopsmith-plugin-simplify-chords)  | Changes complex chords on the note highway to simpler ones. Inspired by Ultimate Guitar's Simplify button. | `git clone ...slopsmith-plugin-simplify-chords.git simplify-chords`     |
+
 
 Install any plugin by cloning it into your `plugins/` directory and restarting:
 
@@ -392,4 +510,8 @@ See `tests/browser/README.md` for full documentation on browser tests.
 
 ## License
 
-MIT
+Slopsmith is licensed under the [GNU Affero General Public License v3.0](LICENSE) (AGPL-3.0-only).
+
+You are free to use, modify, and redistribute Slopsmith — including running it on your own server. If you distribute modified versions, or run a modified version that interacts with users over a network, you must make the corresponding source code available under the same license. See [CONTRIBUTING.md](CONTRIBUTING.md) for contributor terms (DCO sign-off, plugin licensing policy).
+
+Bundled and vendored third-party code retains its original license — see [`rscli/LICENSE`](rscli/LICENSE) for the F# wrapper based on [Rocksmith2014.NET](https://github.com/iminashi/Rocksmith2014.NET) (MIT), and individual plugin repositories for plugin licenses.

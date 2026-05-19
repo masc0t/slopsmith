@@ -33,6 +33,14 @@ from pathlib import Path
 
 import yaml
 
+# Make `lib/` importable regardless of CWD so we can share ffmpeg
+# helpers (including the libvorbis → built-in vorbis fallback).
+_HERE = Path(__file__).resolve().parent
+_ROOT = _HERE.parent
+sys.path.insert(0, str(_ROOT / "lib"))
+
+from audio import _ffmpeg_cmd, _ffmpeg_wav_to_ogg  # noqa: E402
+
 
 # Demucs outputs WAVs named {stem}.wav in a per-track subfolder. We re-encode
 # them to OGG/Vorbis with ffmpeg to match the rest of the sloppak format.
@@ -67,12 +75,11 @@ def _run_demucs(full_ogg: Path, out_dir: Path, model: str) -> Path:
 
 
 def _encode_ogg(wav_path: Path, ogg_path: Path) -> None:
+    ffmpeg = _ffmpeg_cmd() or "ffmpeg"
     ogg_path.parent.mkdir(parents=True, exist_ok=True)
-    r = subprocess.run(
-        ["ffmpeg", "-y", "-i", str(wav_path),
-         "-c:a", "libvorbis", "-q:a", "5", str(ogg_path)],
-        capture_output=True,
-    )
+    # Shared helper handles the libvorbis → built-in vorbis fallback
+    # when the host ffmpeg was built without --enable-libvorbis.
+    r = _ffmpeg_wav_to_ogg(ffmpeg, wav_path, ogg_path)
     if r.returncode != 0 or not ogg_path.exists():
         raise RuntimeError(
             f"ffmpeg OGG encode failed for {wav_path.name}: "
