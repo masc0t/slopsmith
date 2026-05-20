@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# shellcheck shell=bash 
+# shellcheck shell=bash
 # =============================================================================
 # build-proxmox-ct.sh  –  Build a Proxmox LXC rootfs from WSL2 (no lxc-start)
 #
