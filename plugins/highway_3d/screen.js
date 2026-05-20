@@ -155,6 +155,19 @@
 
     const AHEAD = 4.0;
     const BEHIND = 0.5;
+    // How long a note/chord-frame stays renderable past the hit line while a
+    // note-state provider (slopsmith#254) is attached. The provider's
+    // hit/miss verdict is asynchronous — the engine-side verifier reports it
+    // ~0.35-0.5 s after the line — so the default ~50 ms note linger /
+    // ~0.48 s chord linger lapses before the tint can apply. Drives both
+    // the outer-loop cull (ndVerdictT0) and the smart drawNote cull below.
+    const NOTEDETECT_GEM_VERDICT_WINDOW = 0.75;
+    // chDt threshold past the hit line at which the chord-frame scan
+    // gives up on an arpeggio-style frame whose constituents never come
+    // in. Must be < NOTEDETECT_GEM_VERDICT_WINDOW (the rim's draw life
+    // in detect mode); placing it at 0.55 s leaves ~0.2 s of the visible
+    // window for the latch to fire and skip subsequent scans.
+    const _ND_UNMATCHED_LATCH_AFTER = 0.55;
     // Sample approach offsets dt in [0, AHEAD] into strips. Lane quads use
     // z = dZ(dt) + TS*BEHIND = TS*(BEHIND - dt), while notes use z = dZ(n.t-now).
     // So note hit line (z=0) aligns with dt=BEHIND, not dt=0. Chart time at
@@ -1801,7 +1814,7 @@
         // alongside mWhiteOutline; swapped onto the note's outline mesh
         // when a recent notedetect:hit / :miss event matches the note's
         // (s, f, t).
-        let mHitOutline = null, mMissOutline = null;
+        let mHitOutline = null, mMissOutline = null, mMissCore = null;
         let pSusOutline = null;
         let projMeshArr = null;
         let _probe = null;
@@ -2025,6 +2038,11 @@
         // beyond the current pre-hit-line frontier. Also cleared in
         // destroy().
         let _chordVerdicts = new Map();
+        // Previous-frame `now` for the chord-verdicts pruner — on a
+        // backward seek the latches behind that time become "future"
+        // entries the forward-only prune can't reach, so we wipe the
+        // map instead of paying an O(n) scan per frame to find them.
+        let _chordVerdictsLastNow = null;
         // Per-frame timestamp captured by update() and used by its
         // prune pass for the notedetect mark arrays. drawNote itself
         // no longer reads it — pruning lives once per frame so
@@ -2041,6 +2059,7 @@
         // with no scorer registered. Older note_detect builds that only
         // emit notedetect:hit/miss events still work via _ndHitMarks.
         let _ndGetNoteState = null;
+        let _ndHasProvider = false;  // true iff a note-state provider is registered (slopsmith#254)
 
         // Object pools
         let pNote, pSus, pLbl, pBeat, pSec;
@@ -3727,6 +3746,12 @@
             // recent notedetect events.
             mHitOutline = new T.MeshLambertMaterial({ color: 0x40ff70, emissive: 0x40ff70, emissiveIntensity: 1.0, transparent: true, opacity: 1.0, depthWrite: false });
             mMissOutline = new T.MeshLambertMaterial({ color: 0xff4040, emissive: 0xff4040, emissiveIntensity: 1.0, transparent: true, opacity: 1.0, depthWrite: false });
+            // Dark charcoal core for missed gems: pairs with the red
+            // mMissOutline ring to produce an "extinguished" gem look that
+            // reads as a miss on every string, including those whose hue
+            // is already red. Lower emissive than the outline so the ring
+            // dominates and the gem reads as a dark body with a red rim.
+            mMissCore = new T.MeshLambertMaterial({ color: 0x181818, emissive: 0x401010, emissiveIntensity: 0.4, transparent: true, opacity: 1.0, depthWrite: false });
             mSusOutline = new T.MeshLambertMaterial({ color: 0xffffff, emissive: 0xffffff, emissiveIntensity: 0.3, transparent: true, opacity: 0.75, depthWrite: false });
             mBeatM = new T.LineBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.25 });
             mBeatQ = new T.LineBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.07 });
@@ -4560,6 +4585,7 @@
             if (mWhiteOutline) mWhiteOutline.emissiveIntensity = 0.6 * g;
             if (mHitOutline)   mHitOutline.emissiveIntensity   = 1.0 * g;
             if (mMissOutline)  mMissOutline.emissiveIntensity  = 1.0 * g;
+            if (mMissCore)     mMissCore.emissiveIntensity     = 0.4 * g;
             if (mSusOutline)   mSusOutline.emissiveIntensity   = 0.3 * g;
             if (mTapChevron)   mTapChevron.emissiveIntensity   = 0.9 * g;
             if (mBarre)        mBarre.emissiveIntensity        = 0.9 * g;
@@ -5711,11 +5737,69 @@
             }
             // slopsmith#254 — capture core's per-note judgment provider for
             // this frame's drawNote() calls (held-sustain glow + lit gems).
+            // bundle.getNoteState is ALWAYS present (the core stub returns
+            // null when no provider is registered), so its existence isn't
+            // a "detect mode active" signal on its own.
+            // bundle.getNoteStateProvider exposes the registered provider
+            // (or null) directly — drive cull-window / chord-rim-floor
+            // extensions off that so they don't activate in non-detect
+            // mode. Downlevel hosts without getNoteStateProvider fall
+            // back to the existence check, matching pre-PR behavior on
+            // those builds.
             _ndGetNoteState = (bundle && typeof bundle.getNoteState === 'function') ? bundle.getNoteState : null;
+            _ndHasProvider = (bundle && typeof bundle.getNoteStateProvider === 'function')
+                ? bundle.getNoteStateProvider() != null
+                : !!_ndGetNoteState;
 
             const now = bundle.currentTime;
             const t0 = now - BEHIND;
             const t1 = now + AHEAD;
+            // With a verdict provider attached, keep notes and chord frames
+            // in the outer loop past BEHIND so async verdicts (~0.4 s late)
+            // still land while drawable; per-note / per-frame culling is
+            // tightened back below.
+            const ndVerdictT0 = _ndHasProvider
+                ? now - Math.max(BEHIND, NOTEDETECT_GEM_VERDICT_WINDOW)
+                : t0;
+            // Prune _chordVerdicts latches whose chord has fully scrolled
+            // past the loop's verdict-window cull. Forward playback never
+            // re-encounters a chord, so without this prune the map would
+            // grow unbounded for the rest of the song (each chord onset
+            // contributes one entry, ~hundreds for a typical song).
+            // verdictKey format is `${ch.id}|${ch.t}` (or `_|${ch.t}` when
+            // ch.id is null), so parse the t after the last '|'.
+            //
+            // Backward seek (now < lastNow): every latched entry's
+            // parsedT is now ahead of `now`, the forward-only check below
+            // would skip them all and the map would grow on every loop.
+            // Clear wholesale — the chord-loop's `chDt > 0` eviction
+            // re-creates entries as chords re-enter the pre-hit window.
+            //
+            // Forward playback: iterate every entry. An earlier `break`
+            // optimization assumed Map insertion order tracked chord
+            // time, but entries are inserted when a verdict OBSERVATION
+            // lands — so a later chord whose verdict arrived first could
+            // sit before an earlier chord whose verdict was still
+            // pending, and breaking on the first in-window entry would
+            // leave the now-older later-inserted entries un-pruned. Full
+            // scan is O(n) but n is bounded (chord count in the song,
+            // ~hundreds) so the per-frame cost is microseconds.
+            if (_ndHasProvider && _chordVerdicts.size > 0) {
+                if (_chordVerdictsLastNow !== null && now < _chordVerdictsLastNow - 0.25) {
+                    _chordVerdicts.clear();
+                } else {
+                    const pruneBefore = ndVerdictT0 - 0.5; // safety margin
+                    for (const k of _chordVerdicts.keys()) {
+                        const pipeIdx = k.lastIndexOf('|');
+                        if (pipeIdx < 0) continue;
+                        const parsedT = parseFloat(k.slice(pipeIdx + 1));
+                        if (Number.isFinite(parsedT) && parsedT < pruneBefore) {
+                            _chordVerdicts.delete(k);
+                        }
+                    }
+                }
+            }
+            _chordVerdictsLastNow = now;
 
             const notes = bundle.notes;
             // Skip the merge when inputs are identity-equal to the last
@@ -6248,7 +6332,7 @@
                         const dt = n.t - now;
                         if (dt < AHEAD) highwayIntensity = Math.max(highwayIntensity, 1 - dt / AHEAD);
                     }
-                    if (n.t + (n.sus || 0) < t0 || n.t > t1) continue;
+                    if (n.t + (n.sus || 0) < ndVerdictT0 || n.t > t1) continue;
                     if (!validString(n.s)) continue;
                     // Suppress the gem for linkNext slide-target notes (skipBody=true).
                     // The sustain/slide trail still renders because it now lives outside
@@ -6373,7 +6457,7 @@
 
                     let maxSus = 0;
                     for (const n of chordNotes) if ((n.sus || 0) > maxSus) maxSus = n.sus;
-                    if (ch.t + maxSus < t0 || ch.t > t1) continue;
+                    if (ch.t + maxSus < ndVerdictT0 || ch.t > t1) continue;
 
                     // Repeat-chord detection (consecutive same shape, short gap).
                     // Reuses runSig computed at loop entry — same signature as the
@@ -6539,6 +6623,28 @@
                             chordTailHoldS = Math.min(CHORD_HWY_LINGER_S, Math.max(cjNext.t - ch.t, 1e-3));
                         }
                     }
+                    // slopsmith#254 — engine verdicts land ~0.4 s after the
+                    // chord crosses; on a fast different-voicing sequence
+                    // the clip above can shrink the rim's draw life below
+                    // that, so the green/red latch is set but the rim isn't
+                    // drawn anymore. When a verdict provider is attached,
+                    // floor the hold at NOTEDETECT_GEM_VERDICT_WINDOW so
+                    // the tinted rim is actually visible.
+                    //
+                    // This deliberately overrides the "voicing-change clip
+                    // prevents two stacked cyan frames" behavior documented
+                    // above (the D5→D#5 / Frantic ~2:47 case): the post-hit
+                    // z clamp (Math.min(0, dZ(chDt)) below) pins extended
+                    // frames at z=0, so the two frames do overlap in plane
+                    // — they're distinguished by their now-tinted rim
+                    // colors (green/red verdict vs teal default) rather
+                    // than perspective depth. In detect mode that's the
+                    // right trade: verdict visibility beats the cleaner
+                    // approach silhouette. Without detect mode the
+                    // original clip still applies.
+                    if (_ndHasProvider && chordTailHoldS < NOTEDETECT_GEM_VERDICT_WINDOW) {
+                        chordTailHoldS = NOTEDETECT_GEM_VERDICT_WINDOW;
+                    }
                     const chordTailFadeS = Math.min(CHORD_HWY_FADE_S, chordTailHoldS);
                     if (!deferChordGems) {
                         for (const cn of chordNotes) {
@@ -6617,20 +6723,16 @@
                         const ftSide = isArpeggioFrame ? ft * 1.55 : ft;
                         let rimHex = isArpeggioFrame ? ARPEGGIO_RIM_BLUE_HEX : CHORD_BOX_TEAL_HEX;
                         // slopsmith#254 — once the chord crosses the hit
-                        // line, force the teal frame to red during its
-                        // linger fade unless every chord note is scored
-                        // as hit/active, in which case it's green. The
-                        // green verdict is latched in _chordVerdicts on
-                        // first observation: getNoteState returns null
-                        // once individual constituent glows decay, which
-                        // would otherwise flip the rim back to red mid-
-                        // linger and flicker the box on fast sequences.
-                        // Anything less than a clean grab (miss, partial,
-                        // not-yet-decided) reads as red so the player
-                        // gets a hard fail signal instead of a soft fade.
-                        // Only engages when a scorer is attached — without
-                        // one the teal default holds. Arpeggio frames
-                        // keep their blue identity.
+                        // line, tint the teal frame by the note-state
+                        // provider verdict: green on a clean grab, red on a
+                        // miss. The verdict is async (the engine verifier
+                        // reports ~0.4 s after the line), so the frame stays
+                        // teal while the verdict is still pending — it must
+                        // not flash red before the verdict lands. The green/
+                        // red verdict is latched in _chordVerdicts so it
+                        // can't flicker as constituent glows decay.
+                        // Only engages when a scorer is attached. Arpeggio
+                        // frames keep their blue identity.
                         // Per-occurrence key — ch.id is the template id
                         // (reused across same-shape chord occurrences) so
                         // composing it with ch.t gives one entry per
@@ -6638,31 +6740,122 @@
                         const verdictKey = ch.id != null ? `${ch.id}|${ch.t}` : `_|${ch.t}`;
                         // Evict any stale latch the next time the chord
                         // re-enters the pre-hit window (rewinds, section
-                        // loops, full restarts). Bounds Map growth too —
-                        // entries only live from the hit-line crossing
-                        // until the next pre-hit-line observation, so the
-                        // working set is at most "chords currently in the
-                        // linger fade."
+                        // loops, full restarts). Bounds Map growth too.
                         if (chDt > 0 && _chordVerdicts.has(verdictKey)) {
                             _chordVerdicts.delete(verdictKey);
                         }
-                        if (!isArpeggioFrame && chDt <= 0 && _ndGetNoteState) {
-                            if (_chordVerdicts.get(verdictKey) === 'green') {
+                        // The verdict scan no longer skips authored-handshape
+                        // frames — power chords sometimes carry an explicit
+                        // handshape (RS authoring quirk), which previously
+                        // dropped them into the `isArpeggioFrame` path and
+                        // left them lavender-blue regardless of hit/miss.
+                        // A true arpeggio (handshape over a real sweeping
+                        // note run) is unaffected: its constituents are
+                        // standalone notes judged at their own times, so the
+                        // scan's query at `ch.t` finds nothing for them and
+                        // the frame keeps its lavender default.
+                        if (chDt <= 0 && _ndHasProvider) {
+                            const latched = _chordVerdicts.get(verdictKey);
+                            if (latched === 'green') {
                                 rimHex = CHORD_BOX_HIT_HEX;
+                            } else if (latched === 'red') {
+                                rimHex = CHORD_BOX_MISS_HEX;
+                            } else if (latched === 'unmatched') {
+                                // The first scan past the verdict window
+                                // came up empty (no constituent ever had a
+                                // state — most often a true arpeggio frame
+                                // whose actual notes are judged at their
+                                // own times, not at ch.t). Skip the
+                                // per-frame provider scan and keep the
+                                // frame's default identity (lavender for
+                                // arpeggios, teal for chords). See the
+                                // unmatched-latch below.
                             } else {
+                                // Latch both green AND red:
+                                //   - any constituent 'miss' → red latched.
+                                //     One decisive miss verdict means the
+                                //     chord can't be all-hit; without
+                                //     latching, the rim would fall back to
+                                //     teal once noteStateFor's miss-wash
+                                //     window (~0.6 s TTL) expires and the
+                                //     state returns null again.
+                                //   - all hit/active → green latched.
+                                //   - else (no miss yet, some constituents
+                                //     still null) → keep teal default. A
+                                //     partial state must not flash red on
+                                //     a chord whose verdicts arrive
+                                //     incrementally.
                                 let allHit = chordNotes.length > 0;
+                                let anyMiss = false;
+                                let anyState = false;  // true if any constituent had a non-null state this scan
                                 for (const cn of chordNotes) {
                                     let cs = null;
                                     try { cs = _ndGetNoteState(cn, ch.t); } catch (e) { cs = null; }
                                     const st = (cs && typeof cs === 'object') ? cs.state : cs;
-                                    if (st !== 'hit' && st !== 'active') { allHit = false; break; }
+                                    if (st === 'hit' || st === 'active') {
+                                        anyState = true;
+                                    } else if (st === 'miss') {
+                                        // First miss decides the chord — no
+                                        // point querying the rest of the
+                                        // constituents this frame; the rim
+                                        // is about to be red-latched below.
+                                        // Short-circuits provider calls in
+                                        // chord-dense passages.
+                                        allHit = false;
+                                        anyMiss = true;
+                                        anyState = true;
+                                        break;
+                                    } else {
+                                        // null — undecided yet
+                                        allHit = false;
+                                    }
                                 }
-                                if (allHit) {
+                                if (anyMiss) {
+                                    _chordVerdicts.set(verdictKey, 'red');
+                                    rimHex = CHORD_BOX_MISS_HEX;
+                                } else if (allHit) {
                                     _chordVerdicts.set(verdictKey, 'green');
                                     rimHex = CHORD_BOX_HIT_HEX;
-                                } else {
-                                    rimHex = CHORD_BOX_MISS_HEX;
+                                } else if (chDt < -_ND_UNMATCHED_LATCH_AFTER && !anyState) {
+                                    // The engine verdict typically lands
+                                    // ~0.4 s after the chord crosses the
+                                    // line, so after the
+                                    // _ND_UNMATCHED_LATCH_AFTER threshold
+                                    // we've already waited well past the
+                                    // verdict-arrival window. If no
+                                    // constituent ever returned a non-
+                                    // null state by then, there's no
+                                    // verdict coming for this chord
+                                    // (true arpeggio frames: their actual
+                                    // notes are judged at their own
+                                    // times, never at ch.t — the scan
+                                    // at ch.t finds nothing forever).
+                                    //
+                                    // Latch 'unmatched' so subsequent
+                                    // frames skip the provider scan
+                                    // entirely. The threshold must be
+                                    // INSIDE the chord frame's visible
+                                    // draw window — `chordTailHoldS` is
+                                    // floored to NOTEDETECT_GEM_VERDICT_
+                                    // WINDOW (0.75 s) in detect mode, so
+                                    // chord frames stop drawing at
+                                    // `chDt < -0.75`; a latch threshold
+                                    // at `-NOTEDETECT_GEM_VERDICT_WINDOW`
+                                    // (i.e. exactly -0.75) is unreachable
+                                    // because the draw gate kicks the
+                                    // frame out of the loop first. Place
+                                    // the threshold ~0.55 s past line so
+                                    // it fires for ~0.2 s of the remaining
+                                    // visible window — enough frames to
+                                    // catch and skip future re-scans.
+                                    //
+                                    // The !anyState guard keeps the
+                                    // partial-resolve case (one cn 'hit',
+                                    // another still null) scanning until
+                                    // anyMiss / allHit commits it.
+                                    _chordVerdicts.set(verdictKey, 'unmatched');
                                 }
+                                // else: no verdict yet → leave teal default
                             }
                         }
 
@@ -7724,7 +7917,25 @@
             const y = sY(s);
             const susEnd = n.t + (n.sus || 0);
             const hasSus = n.sus > 0;
-            if (dt < -linger && (!hasSus || now > susEnd)) return;
+            // Smart cull past the normal ~50 ms linger: keep the gem alive
+            // only if a note-state verdict is actually available to display
+            // (so pre-verdict trailing gems don't read as "stuck unjudged"
+            // sliver). With a verdict the gem stays up to
+            // NOTEDETECT_GEM_VERDICT_WINDOW for the green/red border to read.
+            // The probe result is cached in _ndProbed/_ndProbedState so the
+            // later _ndGetNoteState query that drives the outline/core tint
+            // reuses it (avoids two provider calls per note per frame).
+            let _ndProbed = false;
+            let _ndProbedState = null;
+            if (dt < -linger && (!hasSus || now > susEnd)) {
+                if (!_ndHasProvider || dt < -NOTEDETECT_GEM_VERDICT_WINDOW) return;
+                let _ndProbe = null;
+                try { _ndProbe = _ndGetNoteState(n, n.t); } catch (e) { _ndProbe = null; }
+                _ndProbed = true;
+                _ndProbedState = _ndProbe;
+                const _probeSt = (_ndProbe && typeof _ndProbe === 'object') ? _ndProbe.state : _ndProbe;
+                if (_probeSt !== 'hit' && _probeSt !== 'active' && _probeSt !== 'miss') return;
+            }
 
             const sustained = dt < 0 && hasSus && now <= susEnd;
             const hitDist = Math.abs(dt);
@@ -7759,8 +7970,14 @@
             let _ndCs = null;       // raw provider response kept for alpha/color in _ndSizzle
             let _ndCsIsObj = false; // typeof _ndCs === 'object'
             if (_ndGetNoteState) {
+                // Reuse the smart-cull probe result if we already called
+                // _ndGetNoteState for this gem above; otherwise probe now.
                 let _raw = null;
-                try { _raw = _ndGetNoteState(n, n.t); } catch (e) { _raw = null; }
+                if (_ndProbed) {
+                    _raw = _ndProbedState;
+                } else {
+                    try { _raw = _ndGetNoteState(n, n.t); } catch (e) { _raw = null; }
+                }
                 if (_raw) {
                     _ndCsIsObj = typeof _raw === 'object';
                     const _st = _ndCsIsObj ? _raw.state : _raw;
@@ -7828,14 +8045,18 @@
 
                 // slopsmith#254 — apply visual overrides from the provider verdict
                 // (_ndState/_ndGood/_ndCs computed in the hoisted block above).
-                // 'miss' → red outline; 'hit'/'active' → string-tinted outline + sizzle.
+                // 'miss' → red outline; 'hit'/'active' → green outline + sizzle.
+                // A string-tinted outline (the old behaviour) was hard to read
+                // as a verdict — it looked the same as an un-judged note on
+                // that string. A dedicated green border (mHitOutline) reads
+                // unambiguously against the red miss border.
                 // The authoritative _showHit (body brightness, sustain glow) is
                 // already a const from the hoisted block — no reassignment needed here.
                 if (_ndCs) {
                     if (_ndState === 'miss') {
                         _ndOutline = mMissOutline;
                     } else if (_ndGood) {
-                        _ndOutline = mGlow[s];
+                        _ndOutline = mHitOutline;
                         // Carry the provider's alpha (and optional color) through
                         // to the sizzle so a struck-note fade or custom palette
                         // comes through (#254 review).
@@ -7852,7 +8073,11 @@
 
                 // Accent: soft neon outer glow (reference: diffused halo fading out).
                 // Three additive shells drawn behind outline/core; colour = string hue.
-                if (n.ac && mAccentHaloNear[s]) {
+                // Suppressed on a provider miss verdict — a bright accent halo
+                // around a missed gem muddies the dark-core-plus-red-rim fail
+                // signal, matching the same miss-over-accent priority the
+                // gem core material applies below.
+                if (n.ac && _ndState !== 'miss' && mAccentHaloNear[s]) {
                     const rZ = approachRot;
                     const accentShells = [
                         { mat: mAccentHaloFar[s], ixy: ACCENT_HALO_XY_OUTER, iz: ACCENT_HALO_Z_OUTER, zK: 0.012 },
@@ -7888,19 +8113,39 @@
                 outline.renderOrder = 20;
                 outline.position.set(x, y + techniqueYNow, noteZ);
                 outline.rotation.z = approachRot;
+                // slopsmith#254 — a provider hit/miss verdict gets a fatter
+                // outline shell so the green / red border reads clearly as a
+                // ring around the gem. The default 1.1x rim is a hairline on
+                // small fretted gems (it only showed up on the wide open-note
+                // slabs), so a verdict bumps it to 1.5x.
+                const ndRim = (_ndState === 'miss' || _ndGood) ? 1.5 : 1.1;
                 if (n.f === 0) {
                     outline.scale.set(
-                        (35 * K / NW) * 1.1 * rimXY * openWScale,
-                        0.1 * 1.1 * openSlabThickMul,
-                        0.6 * 1.1 * rimZ,
+                        (35 * K / NW) * ndRim * rimXY * openWScale,
+                        0.1 * ndRim * openSlabThickMul,
+                        0.6 * ndRim * rimZ,
                     );
                 } else {
-                    outline.scale.set(1.1 * rimXY, 1.1 * rimXY, 2.8 * rimZ);
+                    outline.scale.set(ndRim * rimXY, ndRim * rimXY, 2.8 * rimZ);
                 }
 
                 // ── Core (filled note body) ───────────────────────────────
                 const core = pNote.get();
-                core.material = n.ac ? mAccentCore[s] : (_showHit ? mGlow[s] : mStr[s]);
+                // slopsmith#254 — on a provider miss verdict, paint the gem
+                // core a dark charcoal (mMissCore) and let the red rim
+                // dominate, so the fail reads as an "extinguished" gem
+                // regardless of which string's natural color it sits on
+                // (a red rim on a red string disappears otherwise). Hits
+                // grab attention with bright mGlow + sizzle; misses get a
+                // distinct dark-with-red-rim look — clear without needing
+                // a string-color contrast that doesn't exist for every lane.
+                // A miss takes priority over the accent (`n.ac`) override —
+                // a missed accented note is still a miss; without this
+                // reordering the brighter mAccentCore would mask the fail
+                // signal on every accent.
+                core.material = (_ndState === 'miss') ? mMissCore
+                    : (n.ac ? mAccentCore[s]
+                        : (_showHit ? mGlow[s] : mStr[s]));
                 core.renderOrder = 21;
                 core.position.set(x, y + techniqueYNow, noteZ + 0.001);
                 core.rotation.z = approachRot;
@@ -8500,7 +8745,7 @@
             // Notedetect outline materials (#9). May not be reachable
             // via scene.traverse if no event ever fired (never attached
             // to a mesh), so dispose explicitly.
-            mHitOutline?.dispose?.(); mMissOutline?.dispose?.();
+            mHitOutline?.dispose?.(); mMissOutline?.dispose?.(); mMissCore?.dispose?.();
             for (const k in txtCache) {
                 const tm = txtCache[k];
                 tm.userData.h3dGhostFretMeshMat?.dispose?.();
@@ -8539,7 +8784,7 @@
             if (ren) { ren.dispose(); ren = null; }
             scene = cam = noteG = beatG = lblG = fretG = tuningLblG = null;
             ambLight = dirLight = null;
-            mStr = []; mGlow = []; mSus = []; mStrHitOutline = []; mAccentOutline = []; mAccentCore = []; mAccentHaloNear = []; mAccentHaloMid = []; mAccentHaloFar = []; mWhiteOutline = mSusOutline = null; mHitOutline = mMissOutline = null; stringLines = []; stringLineGlows = [];
+            mStr = []; mGlow = []; mSus = []; mStrHitOutline = []; mAccentOutline = []; mAccentCore = []; mAccentHaloNear = []; mAccentHaloMid = []; mAccentHaloFar = []; mWhiteOutline = mSusOutline = null; mHitOutline = mMissOutline = mMissCore = null; stringLines = []; stringLineGlows = [];
             for (const m of _inlayMats) m?.dispose?.(); _inlayMats = []; _inlayLabels = [];
             // mTapChevron: dispose explicitly — if no tap marker ever
             // spawned a pooled mesh, the scene.traverse() pass above never

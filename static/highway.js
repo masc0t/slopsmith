@@ -287,6 +287,13 @@ function createHighway() {
         return { state, alpha, color };
     }
 
+    // Stable bundle accessor for the registered provider — see
+    // bundle.getNoteStateProvider below. Defined once per createHighway()
+    // instance (not module scope — _noteStateProvider is per-instance),
+    // so _makeBundle() doesn't reallocate an arrow function per frame
+    // (matches getNoteState: _noteState's stable-reference pattern).
+    function _getNoteStateProvider() { return _noteStateProvider; }
+
     // Paints the judgment effect on top of an already-drawn gem at
     // (cx,cy) with half-extent `r`. `ns` is the normalized state from
     // _noteState (or null → no-op). A miss → faint red wash. A correct
@@ -483,6 +490,12 @@ function createHighway() {
             // or it reports nothing for this note; otherwise
             // { state: 'hit'|'active'|'miss', alpha: 0..1, color: string|null }.
             getNoteState: _noteState,   // stable reference — no per-frame allocation
+            // Lets custom renderers (e.g. highway_3d) tell "is a provider
+            // attached" apart from "no provider, getNoteState always
+            // returns null" — `getNoteState` always exists on the bundle
+            // so its presence alone isn't a useful "detect mode" signal.
+            // Renderers gate verdict-window cull / draw extensions on this.
+            getNoteStateProvider: _getNoteStateProvider, // stable — see above
         };
     }
 

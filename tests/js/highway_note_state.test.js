@@ -54,6 +54,29 @@ test('_makeBundle exposes getNoteState (stable reference, no per-frame alloc)', 
     assert.match(fn, /getNoteState:\s*_noteState\b/, 'bundle.getNoteState must be the stable _noteState reference');
 });
 
+test('_makeBundle exposes getNoteStateProvider as a stable reference (slopsmith#254)', () => {
+    const src = fs.readFileSync(highwayJs, 'utf8');
+    const fn = extractBlock(src, 'function _makeBundle()');
+    // Same allocation discipline as getNoteState: highway_3d uses this
+    // bundle field to tell "provider attached" from "no provider but
+    // getNoteState still exists and returns null", so a per-frame arrow
+    // here would both burn allocations on the hot path and could trip
+    // identity-based guards in renderer code.
+    assert.match(
+        fn,
+        /getNoteStateProvider:\s*_getNoteStateProvider\b/,
+        'bundle.getNoteStateProvider must be the stable _getNoteStateProvider reference (not a per-frame arrow)'
+    );
+    // Sanity: the stable accessor exists per-createHighway-instance
+    // (alongside _noteStateProvider in the closure) and returns the
+    // slot, so renderers see a live "is a provider registered?" view.
+    assert.match(
+        src,
+        /function\s+_getNoteStateProvider\s*\(\s*\)\s*\{\s*return\s+_noteStateProvider\s*;?\s*\}/,
+        '_getNoteStateProvider must be defined as a stable named function returning _noteStateProvider'
+    );
+});
+
 test('_noteState normalizes provider output as documented', () => {
     const src = fs.readFileSync(highwayJs, 'utf8');
     const fn = extractBlock(src, 'function _noteState(note, chartTime)');
@@ -80,4 +103,26 @@ test('3D highway captures bundle.getNoteState and overrides legacy hit/miss with
     // Provider verdict wins: miss => not _showHit; otherwise provider state
     // or the legacy fallback (`hit`) plus the pre-hit ghost window preview.
     assert.match(src, /const\s+_showHit\s*=\s*\(\s*_ndState\s*===\s*['"]miss['"]\s*\)\s*\?\s*false\s*:\s*\(\s*_ndState\s*\?\s*_ndGood\s*:\s*\(\s*hit\s*\|\|\s*\(\s*n\.f\s*>\s*0\s*&&\s*inGhostWin\s*\)\s*\)\s*\)/, '_showHit must honor a provider "miss" and fall back to the hit/ghost heuristic only with no verdict');
+});
+
+test('3D highway captures _ndHasProvider via bundle.getNoteStateProvider (slopsmith#254)', () => {
+    const src = fs.readFileSync(highway3dJs, 'utf8');
+    // Detect-mode behavior — verdict-window cull extension, chord-frame
+    // hold floor, and the smart drawNote cull — must be gated on a real
+    // provider being registered, not on the always-present bundle.
+    // getNoteState. Capture via bundle.getNoteStateProvider() with a
+    // fallback to the getNoteState-existence check so downlevel hosts
+    // (no getNoteStateProvider) still behave as before.
+    assert.match(
+        src,
+        /_ndHasProvider\s*=\s*\(bundle\s*&&\s*typeof\s+bundle\.getNoteStateProvider\s*===\s*['"]function['"]\)[\s\S]{0,80}bundle\.getNoteStateProvider\s*\(\s*\)\s*!=\s*null[\s\S]{0,80}:\s*!!_ndGetNoteState/,
+        'update() must derive _ndHasProvider from bundle.getNoteStateProvider() with a fallback to _ndGetNoteState'
+    );
+    // Verdict-window cull and chord-frame hold floor + smart drawNote
+    // cull must all gate on _ndHasProvider (not _ndGetNoteState alone).
+    assert.match(src, /ndVerdictT0\s*=\s*_ndHasProvider/, 'ndVerdictT0 outer-loop extension must gate on _ndHasProvider');
+    assert.match(src, /if\s*\(\s*_ndHasProvider\s*&&\s*chordTailHoldS\s*<\s*NOTEDETECT_GEM_VERDICT_WINDOW/,
+        'chord-frame hold floor must gate on _ndHasProvider');
+    assert.match(src, /if\s*\(\s*!_ndHasProvider\s*\|\|\s*dt\s*<\s*-NOTEDETECT_GEM_VERDICT_WINDOW\s*\)\s*return/,
+        'drawNote smart-cull provider probe must gate on _ndHasProvider');
 });
