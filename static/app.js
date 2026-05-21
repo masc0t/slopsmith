@@ -887,7 +887,11 @@ async function showScreen(id) {
     if (id === 'home') {
         _libScrollOnNextRender.home = true;
         await loadLibraryProviders({ restoreSaved: true });
-        loadLibrary();
+        _libEpoch++;
+        currentPage = 0;
+        _treeStats = null;
+        stopInfiniteScroll();
+        loadLibrary(0);
     }
     if (id === 'favorites') { _libScrollOnNextRender.favorites = true; loadFavorites(); }
     if (id === 'settings') {
@@ -1077,7 +1081,10 @@ async function loadLibraryProviders({ restoreSaved = false, reloadOnChange = fal
     const hasSavedProvider = !!_providerById(savedProviderId);
     const hasSelectedProvider = !!_providerById(_selectedLibraryProviderId);
     if (hasSavedProvider) _selectedLibraryProviderId = savedProviderId;
-    else if (!hasSelectedProvider) _selectedLibraryProviderId = 'local';
+    else if (restoreSaved) {
+        _selectedLibraryProviderId = 'local';
+        _writePersistedChoice(_LIB_PROVIDER_KEY, 'local');
+    } else if (!hasSelectedProvider) _selectedLibraryProviderId = 'local';
 
     _renderLibraryProviderSelector();
     const afterProviderId = _activeLibraryProviderId();
