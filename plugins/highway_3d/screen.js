@@ -786,9 +786,55 @@
     // silence playback. The leak (one AudioContext + one AnalyserNode,
     // a few KB) is the cost of having a plugin tap audio at all.
     let _bgAudio = null;
+    // The core (#audio-tap) cache is held separately from the stems cache so
+    // we can switch back to it without re-calling createMediaElementSource on
+    // #audio — that call is one-shot per element, and a second one throws
+    // InvalidStateError (which would then be marked permanent and disable
+    // reactivity forever on PSARC songs after any sloppak detour).
+    let _bgAudioCore = null;
     let _bgAudioFailedAt = 0;  // performance.now() of last failure, 0 = never
     const _BG_AUDIO_RETRY_MS = 1000;
+    // _bgReadBands sums bins 0..7 (bass), 8..39 (mid), 40..127 (treble),
+    // so the frequency buffer must hold at least 128 bins regardless of
+    // the source analyser's fftSize.
+    const BG_FREQ_BINS = 128;
     function _bgGetAnalyser() {
+        // Prefer the stems plugin's side-chain analyser when a sloppak is
+        // loaded. As of slopsmith-plugin-stems 0.5.0 (sample-locked playback)
+        // the #audio element is a silent virtual transport on sloppaks, so
+        // tapping it sees only silence; the stems mix is exposed at
+        // window.slopsmith.stems.getAnalyser() instead. The stems plugin
+        // creates and destroys that AnalyserNode per song, so we re-check
+        // each call and key the cache on its identity — when the node
+        // changes (song switch), the cache is replaced automatically.
+        const stemsApi = window.slopsmith && window.slopsmith.stems;
+        const stemsAnalyser = (stemsApi && typeof stemsApi.getAnalyser === 'function')
+            ? stemsApi.getAnalyser() : null;
+        if (stemsAnalyser) {
+            if (!_bgAudio || _bgAudio.source !== 'stems' || _bgAudio.analyser !== stemsAnalyser) {
+                // Adopt the live stems analyser. Do NOT close its context — it's
+                // shared with stem playback and the stems plugin owns its
+                // lifecycle. No play-event resume hooks either; the stems
+                // plugin manages context resume itself.
+                _bgAudio = {
+                    ctx: stemsAnalyser.context,
+                    analyser: stemsAnalyser,
+                    // _bgReadBands reads bins 0..127 unconditionally. Always
+                    // allocate at least 128 bytes so a smaller analyser (e.g.
+                    // fftSize < 256) can't leave undefined values in the loop.
+                    freq: new Uint8Array(Math.max(BG_FREQ_BINS, stemsAnalyser.frequencyBinCount)),
+                    source: 'stems',
+                };
+            }
+            return _bgAudio;
+        }
+        // No sloppak active — drop a stale stems-sourced cache, restoring the
+        // core-tap cache if we'd already built one. Without this, the next
+        // step would try to createMediaElementSource(#audio) a second time
+        // (one-shot per element) and throw InvalidStateError — disabling
+        // reactivity for the rest of the page lifetime.
+        if (_bgAudio && _bgAudio.source === 'stems') _bgAudio = _bgAudioCore;
+
         if (_bgAudio && !_bgAudio.failed) return _bgAudio;
         if (_bgAudio && _bgAudio.failed) {
             // Distinguish permanent failures from transient ones.
@@ -816,7 +862,11 @@
             analyser.fftSize = 256;
             source.connect(analyser);
             analyser.connect(ctx.destination);
-            _bgAudio = { ctx, analyser, freq: new Uint8Array(analyser.frequencyBinCount) };
+            _bgAudio = { ctx, analyser, freq: new Uint8Array(Math.max(BG_FREQ_BINS, analyser.frequencyBinCount)), source: 'core' };
+            // Remember the core analyser so a later stems-then-back-to-core
+            // transition can re-use it instead of re-tapping #audio (which
+            // would throw InvalidStateError on the one-shot per element).
+            _bgAudioCore = _bgAudio;
             // Browsers with autoplay restrictions hand back a suspended
             // AudioContext; createMediaElementSource then routes the
             // <audio> through that suspended graph and playback goes
