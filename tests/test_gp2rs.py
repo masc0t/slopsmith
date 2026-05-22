@@ -28,6 +28,7 @@ from gp2rs import (
     _standard_tuning_for,
     _tempo_at_tick,
     _tick_to_seconds,
+    convert_piano_track,
     convert_track,
 )
 
@@ -695,3 +696,64 @@ def test_two_normal_notes_on_same_string_are_both_emitted():
     assert len(notes) == 2
     assert notes[0].get("fret") == "5"
     assert notes[1].get("fret") == "7"
+
+
+# ── convert_piano_track: tied-note pitch-bucket collision ─────────────────────
+# MIDI notes 48 (C4) and 50 (D4) both map to rs_string=2. A chord containing
+# both, followed by ties for both, must extend each note individually — not
+# share a single rs_string=2 bucket that only tracks whichever was stored last.
+
+def _piano_song(beats):
+    """One-measure mock for convert_piano_track with two GP strings at MIDI 48 and 50."""
+    voice = SimpleNamespace(beats=beats)
+    measure = SimpleNamespace(voices=[voice])
+    strings = [
+        SimpleNamespace(number=1, value=48),  # C4 — encodes to rs_string=2, rs_fret=0
+        SimpleNamespace(number=2, value=50),  # D4 — encodes to rs_string=2, rs_fret=2
+    ]
+    track = SimpleNamespace(
+        strings=strings,
+        channel=SimpleNamespace(instrument=0),
+        measures=[measure],
+        name="Piano",
+    )
+    mh = SimpleNamespace(
+        start=0, number=1,
+        timeSignature=SimpleNamespace(numerator=4, denominator=SimpleNamespace(value=4)),
+        isRepeatOpen=False, repeatClose=-1, repeatAlternative=0,
+        direction=None, fromDirection=None, marker=None,
+    )
+    return SimpleNamespace(
+        title="Test", artist="Test", album="Test",
+        copyright=None, subtitle=None, tempo=120,
+        tracks=[track],
+        measureHeaders=[mh],
+    )
+
+
+def test_piano_tied_chord_both_notes_extended():
+    """Two simultaneous piano notes in the same rs_string bucket must each get
+    their own sustain extension — not share a single string-keyed slot."""
+    # Beat 1: chord of MIDI 48 (gp_str=1) and MIDI 50 (gp_str=2), both 0.5 s
+    n_c4 = _ct_note(guitarpro.NoteType.normal, gp_string=1, fret=0)
+    n_d4 = _ct_note(guitarpro.NoteType.normal, gp_string=2, fret=0)
+    beat1 = _ct_beat(tick=0, dur_value=4, notes=[n_c4, n_d4])
+
+    # Beat 2: ties for both — should extend each note to ~1.0 s
+    t_c4 = _ct_note(guitarpro.NoteType.tie, gp_string=1, fret=0)
+    t_d4 = _ct_note(guitarpro.NoteType.tie, gp_string=2, fret=0)
+    beat2 = _ct_beat(tick=GP_TICKS_PER_QUARTER, dur_value=4, notes=[t_c4, t_d4])
+
+    xml_str = convert_piano_track(_piano_song([beat1, beat2]), track_index=0)
+    root = ET.fromstring(xml_str)
+    chords = root.findall(".//chords/chord")
+
+    assert len(chords) == 1, "tie beat must not emit a second chord"
+    chord_notes = chords[0].findall("chordNote")
+    assert len(chord_notes) == 2
+
+    for cn in chord_notes:
+        sustain = float(cn.get("sustain"))
+        assert sustain == pytest.approx(1.0, abs=0.01), (
+            f"fret={cn.get('fret')} sustain={sustain:.3f}, expected ~1.0 s"
+        )
