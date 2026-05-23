@@ -934,6 +934,15 @@ def _library_art_response(result: Any) -> Response:
         safe_url = _safe_art_redirect_url(result)
         if safe_url is not None:
             return RedirectResponse(safe_url)
+        # If the string looks like a URL (contains a scheme separator) but
+        # didn't pass the http/https check, refuse it rather than treating
+        # it as a filesystem path — a provider returning ftp:// or file://
+        # should get a 400, not a 500 from FileResponse failing on a URL.
+        if "://" in result:
+            raise HTTPException(
+                status_code=400,
+                detail="Library provider returned an unsupported URL scheme for art",
+            )
         return FileResponse(result)
     if isinstance(result, Path):
         return FileResponse(str(result))
@@ -2574,6 +2583,7 @@ async def list_artists(letter: str = "", q: str = "", favorites: int = 0, page: 
                        stems_has: str = "", stems_lacks: str = "",
                        has_lyrics: str = "", tunings: str = "", provider: str = "local"):
     """Get artists grouped by letter with albums and songs (for tree view)."""
+    size = min(size, 100)
     library_provider = _get_library_provider(provider)
     _require_library_provider_capability(library_provider, "library.read")
     artists, total = await _call_library_provider_async(
@@ -2581,7 +2591,7 @@ async def list_artists(letter: str = "", q: str = "", favorites: int = 0, page: 
         "query_artists",
         letter=letter,
         page=page,
-        size=min(size, 100),
+        size=size,
         **_library_filter_args(
             q=q, favorites=favorites, format=format,
             arrangements_has=arrangements_has, arrangements_lacks=arrangements_lacks,
