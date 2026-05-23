@@ -916,7 +916,7 @@ def _safe_art_redirect_url(url: str) -> str | None:
         parsed = urlparse(url)
         if parsed.scheme.lower() not in ("http", "https"):
             return None
-        if not parsed.netloc:
+        if not parsed.hostname:
             return None
         return url
     except Exception:

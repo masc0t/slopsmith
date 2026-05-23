@@ -5845,6 +5845,7 @@ async function syncLibrarySong(providerId, songId, { playWhenReady = false } = {
         _treeStats = null;
         _favTreeStats = null;
         _tuningNames = null;
+        _libEpoch++;
         await loadLibrary(0);
         if (playWhenReady && localFilename) playSong(encodeURIComponent(localFilename));
         return data;
