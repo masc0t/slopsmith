@@ -627,14 +627,14 @@ def convert_track(
     _prev_mh_index: int = -1  # sentinel: no previous entry
 
     for entry in schedule:
-        # Clear the tie-tracking state whenever the schedule does not advance
-        # to the very next consecutive authored measure.  This covers:
-        #   • repeat loopbacks / D.S./D.C. (mh_index goes backwards), and
-        #   • forward skips (volta alternatives, al-Coda redirects) that jump
-        #     over one or more measures.
-        # A tie can only bridge two *immediately adjacent* authored measures;
-        # any other schedule transition is a discontinuity.
-        if _prev_mh_index != -1 and entry.mh_index != _prev_mh_index + 1:
+        # Clear the tie-tracking state on backward jumps in the playback
+        # schedule (repeat loopbacks, D.S., D.C.).  A tie at the start of
+        # a repeated section must not extend the last note from the previous
+        # pass through that section.  Forward skips (volta alternatives,
+        # al-Coda redirects) are *not* cleared because consecutive schedule
+        # entries that jump forward are still adjacent in the output audio,
+        # so a tie crossing such a boundary is semantically valid.
+        if _prev_mh_index != -1 and entry.mh_index <= _prev_mh_index:
             last_note_per_string.clear()
         _prev_mh_index = entry.mh_index
         measure = track.measures[entry.mh_index]
@@ -658,7 +658,7 @@ def convert_track(
 
                     if note.type == guitarpro.NoteType.tie:
                         prev = last_note_per_string.get(rs_str)
-                        if prev is not None:
+                        if prev is not None and prev.time < t:
                             prev.sustain = max(prev.sustain, (t + dur) - prev.time)
                         continue
 
@@ -711,7 +711,9 @@ def convert_track(
                         rn.tremolo = True
 
                     beat_notes.append(rn)
-                    last_note_per_string[rs_str] = rn
+                    existing = last_note_per_string.get(rs_str)
+                    if existing is None or rn.time >= existing.time:
+                        last_note_per_string[rs_str] = rn
 
                 if not beat_notes:
                     continue
@@ -1187,14 +1189,14 @@ def convert_piano_track(
     _prev_mh_index: int = -1  # sentinel: no previous entry
 
     for entry in schedule:
-        # Clear the tie-tracking state whenever the schedule does not advance
-        # to the very next consecutive authored measure.  This covers:
-        #   • repeat loopbacks / D.S./D.C. (mh_index goes backwards), and
-        #   • forward skips (volta alternatives, al-Coda redirects) that jump
-        #     over one or more measures.
-        # A tie can only bridge two *immediately adjacent* authored measures;
-        # any other schedule transition is a discontinuity.
-        if _prev_mh_index != -1 and entry.mh_index != _prev_mh_index + 1:
+        # Clear the tie-tracking state on backward jumps in the playback
+        # schedule (repeat loopbacks, D.S., D.C.).  A tie at the start of
+        # a repeated section must not extend the last note from the previous
+        # pass through that section.  Forward skips (volta alternatives,
+        # al-Coda redirects) are *not* cleared because consecutive schedule
+        # entries that jump forward are still adjacent in the output audio,
+        # so a tie crossing such a boundary is semantically valid.
+        if _prev_mh_index != -1 and entry.mh_index <= _prev_mh_index:
             last_note_per_pitch.clear()
         _prev_mh_index = entry.mh_index
         measure = track.measures[entry.mh_index]
@@ -1230,7 +1232,7 @@ def convert_piano_track(
 
                     if note.type == guitarpro.NoteType.tie:
                         prev = last_note_per_pitch.get((rs_string, rs_fret))
-                        if prev is not None:
+                        if prev is not None and prev.time < t:
                             prev.sustain = max(prev.sustain, (t + dur) - prev.time)
                         continue
 
@@ -1248,7 +1250,10 @@ def convert_piano_track(
                         rn.accent = True
 
                     beat_notes.append(rn)
-                    last_note_per_pitch[(rs_string, rs_fret)] = rn
+                    pitch_key = (rs_string, rs_fret)
+                    existing = last_note_per_pitch.get(pitch_key)
+                    if existing is None or rn.time >= existing.time:
+                        last_note_per_pitch[pitch_key] = rn
 
                 if not beat_notes:
                     continue

@@ -682,6 +682,61 @@ def test_tied_note_without_predecessor_is_silently_dropped():
     assert len(notes) == 0
 
 
+def _ct_multivoice_song(voices_beats):
+    """Multi-voice variant of _ct_song. `voices_beats` is a list of beat-lists,
+    one per voice, all on the same single measure."""
+    voices = [SimpleNamespace(beats=beats) for beats in voices_beats]
+    measure = SimpleNamespace(voices=voices)
+    strings = [SimpleNamespace(number=i + 1, value=v)
+               for i, v in enumerate([64, 59, 55, 50, 45, 40])]
+    track = SimpleNamespace(
+        strings=strings,
+        channel=SimpleNamespace(instrument=24),
+        measures=[measure],
+        name="Guitar",
+    )
+    mh = SimpleNamespace(
+        start=0, number=1,
+        timeSignature=SimpleNamespace(numerator=4, denominator=SimpleNamespace(value=4)),
+        isRepeatOpen=False, repeatClose=-1, repeatAlternative=0,
+        direction=None, fromDirection=None, marker=None,
+    )
+    return SimpleNamespace(
+        title="Test", artist="Test", album="Test",
+        copyright=None, subtitle=None, tempo=120,
+        tracks=[track],
+        measureHeaders=[mh],
+    )
+
+
+def test_tie_does_not_attach_to_overwritten_earlier_voice_note():
+    """Voices are processed sequentially. Without an overwrite guard
+    (`rn.time >= existing.time` before updating last_note_per_string),
+    voice 1's beat-0 note would replace voice 0's beat-4 entry in the dict,
+    and voice 1's beat-6 tie would then incorrectly extend voice 1's beat-0
+    sustain across voice 0's beat-4 territory."""
+    # Voice 0: beat 4 fret 7 (t=2.0, sustain 0.5) — populates dict[string=1] first
+    v0_beat4 = _ct_beat(tick=GP_TICKS_PER_QUARTER * 4, dur_value=4,
+                        notes=[_ct_note(guitarpro.NoteType.normal, gp_string=1, fret=7)])
+    # Voice 1: beat 0 fret 5 (t=0) and tie at beat 6 (t=3.0)
+    v1_beat0 = _ct_beat(tick=0, dur_value=4,
+                        notes=[_ct_note(guitarpro.NoteType.normal, gp_string=1, fret=5)])
+    v1_tie = _ct_beat(tick=GP_TICKS_PER_QUARTER * 6, dur_value=4,
+                      notes=[_ct_note(guitarpro.NoteType.tie, gp_string=1, fret=0)])
+
+    xml_str = convert_track(_ct_multivoice_song([[v0_beat4], [v1_beat0, v1_tie]]),
+                            track_index=0)
+    root = ET.fromstring(xml_str)
+    notes = root.findall(".//notes/note")
+
+    sustains = {n.get("fret"): float(n.get("sustain")) for n in notes}
+    # Voice 1's beat-0 (fret 5) sustain must stay at its own duration (~0.5 s).
+    # Without the overwrite guard it would be inflated to ~3.5 s by the tie.
+    assert sustains.get("5") == pytest.approx(0.5, abs=0.01), \
+        "overwrite guard must keep voice 0's beat-4 as the tracked predecessor; " \
+        "voice 1's beat-0 sustain must not balloon to cover the tie's target time"
+
+
 def test_two_normal_notes_on_same_string_are_both_emitted():
     """Non-tied consecutive notes on the same string each produce a note event."""
     note1 = _ct_note(guitarpro.NoteType.normal, gp_string=1, fret=5)
@@ -759,11 +814,12 @@ def test_piano_tied_chord_both_notes_extended():
         )
 
 
-# ── convert_track: tie must not cross a non-consecutive schedule boundary ─────
-# When the playback schedule jumps to a non-consecutive authored measure (repeat
-# loopbacks go backwards; volta skips and al-Coda redirects jump forward over
-# measures), the tie-tracking state must be cleared so a tie note at the jump
-# target cannot accidentally extend an unrelated note from the previous entry.
+# ── convert_track: tie must not cross a backward repeat boundary ──────────────
+# When the playback schedule loops backwards (repeat loopbacks, D.S., D.C.),
+# the tie-tracking state must be cleared so a tie note at the start of a
+# repeated section cannot accidentally extend the last note from the previous
+# pass.  Forward skips (volta alternatives, al-Coda redirects) are NOT cleared
+# because consecutive forward schedule entries are adjacent in the output audio.
 
 
 def _ct_song_repeat(beats_m0, beats_m1):
