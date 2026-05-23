@@ -3825,7 +3825,8 @@ function setSpeed(v) {
     }
     if (window._juceMode) {
         window.jucePlayer?.setRate(rate);
-        window.slopsmithDesktop?.audio?.setBackingSpeed(rate);
+        Promise.resolve(window.slopsmithDesktop?.audio?.setBackingSpeed(rate))
+            .catch(err => console.warn('[setSpeed] setBackingSpeed failed:', err));
     } else {
         audio.playbackRate = rate;
     }
