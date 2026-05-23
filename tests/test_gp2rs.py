@@ -853,7 +853,8 @@ def test_tie_not_extended_across_repeat_boundary():
     assert len(notes) == 2, (
         f"repeat boundary must not allow tie to extend across passes; got {len(notes)} notes"
     )
-    # Neither note's sustain should be inflated (sustain < threshold → 0.0 for quarter note)
+    # Each note should have its authored sustain (~0.5 s for a quarter at 120 BPM),
+    # not an inflated value caused by an erroneous cross-boundary tie extension.
     for n in notes:
         sustain = float(n.get("sustain"))
         # quarter note at 120 BPM = 0.5 s, which is > 0.2 threshold → sustain=0.5
