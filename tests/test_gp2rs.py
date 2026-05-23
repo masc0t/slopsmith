@@ -757,3 +757,106 @@ def test_piano_tied_chord_both_notes_extended():
         assert sustain == pytest.approx(1.0, abs=0.01), (
             f"fret={cn.get('fret')} sustain={sustain:.3f}, expected ~1.0 s"
         )
+
+
+# ── convert_track: tie must not cross a repeat-loopback boundary ─────────────
+# When the playback schedule jumps backwards (measure B → measure A again in a
+# repeat), the tie-tracking state must be cleared so a tie note at the start of
+# measure A on the second pass cannot accidentally extend the last note emitted
+# from measure B (end of the first pass).
+
+
+def _ct_song_repeat(beats_m0, beats_m1):
+    """Two-measure mock song where measure 0 is the repeat-open and measure 1
+    is the repeat-close (×1 extra repeat → plays twice total).
+
+    120 BPM, 4/4, standard 6-string guitar.
+    """
+    voice0 = SimpleNamespace(beats=beats_m0)
+    voice1 = SimpleNamespace(beats=beats_m1)
+    measure0 = SimpleNamespace(voices=[voice0])
+    measure1 = SimpleNamespace(voices=[voice1])
+    strings = [SimpleNamespace(number=i + 1, value=v)
+               for i, v in enumerate([64, 59, 55, 50, 45, 40])]
+    track = SimpleNamespace(
+        strings=strings,
+        channel=SimpleNamespace(instrument=24),
+        measures=[measure0, measure1],
+        name="Guitar",
+    )
+    # measure 0: repeat open, tick 0
+    mh0 = SimpleNamespace(
+        start=0,
+        number=1,
+        timeSignature=SimpleNamespace(
+            numerator=4, denominator=SimpleNamespace(value=4)
+        ),
+        isRepeatOpen=True,
+        repeatClose=-1,       # close is on mh1
+        repeatAlternative=0,
+        direction=None,
+        fromDirection=None,
+        marker=None,
+    )
+    # measure 1: repeat close, plays the bracket one extra time (total ×2)
+    mh1 = SimpleNamespace(
+        start=4 * GP_TICKS_PER_QUARTER,
+        number=2,
+        timeSignature=SimpleNamespace(
+            numerator=4, denominator=SimpleNamespace(value=4)
+        ),
+        isRepeatOpen=False,
+        repeatClose=1,        # repeat the bracket once more → 2 total passes
+        repeatAlternative=0,
+        direction=None,
+        fromDirection=None,
+        marker=None,
+    )
+    return SimpleNamespace(
+        title="Test",
+        artist="Test",
+        album="Test",
+        copyright=None,
+        subtitle=None,
+        tempo=120,
+        tracks=[track],
+        measureHeaders=[mh0, mh1],
+    )
+
+
+def test_tie_not_extended_across_repeat_boundary():
+    """A tie note at the start of a repeated section must be silently dropped on
+    the second pass — not extend the last note from the end of the first pass.
+
+    Schedule after repeat expansion:
+      mh=0 pass0 → mh=1 pass0 → mh=0 pass1 → mh=1 pass1
+
+    Measure 0 beat0 is a tie on string 1.  No previous note exists on pass0
+    (correctly dropped).  Measure 1 beat0 is a normal note on string 1.
+
+    Without the repeat-boundary clear, on pass1 the tie in mh=0 would
+    incorrectly extend measure 1's note from pass0.  With the clear it is
+    dropped (still no valid predecessor within this pass).
+    """
+    # measure 0: tie on string 1 (no predecessor on first pass → should drop)
+    tie_beat = _ct_beat(tick=0, dur_value=4,
+                        notes=[_ct_note(guitarpro.NoteType.tie, gp_string=1, fret=5)])
+    # measure 1: normal note on string 1
+    normal_beat = _ct_beat(tick=4 * GP_TICKS_PER_QUARTER, dur_value=4,
+                           notes=[_ct_note(guitarpro.NoteType.normal, gp_string=1, fret=5)])
+
+    xml_str = convert_track(_ct_song_repeat([tie_beat], [normal_beat]), track_index=0)
+    root = ET.fromstring(xml_str)
+    notes = root.findall(".//notes/note")
+
+    # Two passes through measure 1 → two normal notes; the ties are both dropped.
+    assert len(notes) == 2, (
+        f"repeat boundary must not allow tie to extend across passes; got {len(notes)} notes"
+    )
+    # Neither note's sustain should be inflated (sustain < threshold → 0.0 for quarter note)
+    for n in notes:
+        sustain = float(n.get("sustain"))
+        # quarter note at 120 BPM = 0.5 s, which is > 0.2 threshold → sustain=0.5
+        assert sustain == pytest.approx(0.5, abs=0.01), (
+            f"sustain should be ~0.5 s (one quarter note), got {sustain:.3f}"
+        )

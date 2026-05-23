@@ -624,8 +624,15 @@ def convert_track(
     chord_templates: list[ChordTemplate] = []
     chord_template_map: dict[tuple, int] = {}  # fret tuple → index
     last_note_per_string: dict[int, RsNote] = {}  # for tie sustain extension
+    _prev_mh_index: int = -1  # sentinel: no previous entry
 
     for entry in schedule:
+        # A repeat loopback or D.S./D.C. jump means the authored timeline
+        # goes backwards. Ties cannot span that discontinuity, so clear the
+        # tracking dict at every non-monotone schedule boundary.
+        if entry.mh_index <= _prev_mh_index:
+            last_note_per_string.clear()
+        _prev_mh_index = entry.mh_index
         measure = track.measures[entry.mh_index]
         for voice in measure.voices:
             for beat in voice.beats:
@@ -1173,8 +1180,15 @@ def convert_piano_track(
     chord_templates: list[ChordTemplate] = []
     chord_template_map: dict[tuple, int] = {}
     last_note_per_pitch: dict[tuple[int, int], RsNote] = {}  # (rs_string, rs_fret) → note, for tie sustain extension
+    _prev_mh_index: int = -1  # sentinel: no previous entry
 
     for entry in schedule:
+        # A repeat loopback or D.S./D.C. jump means the authored timeline
+        # goes backwards. Ties cannot span that discontinuity, so clear the
+        # tracking dict at every non-monotone schedule boundary.
+        if entry.mh_index <= _prev_mh_index:
+            last_note_per_pitch.clear()
+        _prev_mh_index = entry.mh_index
         measure = track.measures[entry.mh_index]
         for voice in measure.voices:
             for beat in voice.beats:
