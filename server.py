@@ -247,34 +247,62 @@ def _env_flag(name: str) -> bool:
 # ── SQLite metadata cache ─────────────────────────────────────────────────────
 
 def _ensure_smart_names(arrangements: list[dict]) -> list[dict]:
-    """Fill in missing ``smart_name`` fields on arrangement dicts from the DB.
+    """Fill in missing ``smart_name`` fields and sort arrangements by smart order.
+
+    Applied to every library query result so the client always receives
+    arrangements in priority order:
+      Lead → Alt. Lead [1,2,…] → Bonus Lead [1,2,…]
+      → Rhythm → Alt. Rhythm → Bonus Rhythm
+      → Bass → Alt. Bass → Bonus Bass → other
 
     Rows scanned before the smart-naming feature was introduced don't carry a
-    ``smart_name`` key.  Rather than requiring a full rescan, compute the names
-    on the fly using the name-based fallback (which is accurate for the
-    majority of well-formed CDLC and all sloppak songs).  Rows that already
-    have the field are left untouched.
+    ``smart_name`` key.  The background scanner automatically rescans those rows
+    to populate the field from authoritative manifest JSON path flags.
+
+    In the meantime this function provides a best-effort on-the-fly computation.
+    However, when multiple arrangements share the same name (e.g. two "Combo"
+    tracks in a PSARC that bundles all path flags as zero), name-based inference
+    cannot distinguish Lead from Rhythm — so we emit ``smart_name: null`` and
+    let the UI fall back to the legacy name until the background rescan corrects
+    the row.  Arrangements that already have the field are never modified.
     """
     if not arrangements:
         return arrangements
-    if all("smart_name" in a for a in arrangements):
-        return arrangements
-    from song import Arrangement as _ArrCls
-    arr_objs = [
-        _ArrCls(
-            name=a.get("name", ""),
-            path_lead=a.get("_path_lead", False),
-            path_rhythm=a.get("_path_rhythm", False),
-            path_bass=a.get("_path_bass", False),
-            bonus_arr=a.get("_bonus_arr", False),
-            represent=a.get("_represent", 0),
-        )
-        for a in arrangements
-    ]
-    smart = compute_smart_names(arr_objs)
-    for a, sn in zip(arrangements, smart):
-        if "smart_name" not in a:
-            a["smart_name"] = sn
+
+    # Fill in missing smart_name values.
+    if not all("smart_name" in a for a in arrangements):
+        # Detect duplicate raw names among the missing entries.  Duplicates mean
+        # the name-based fallback cannot reliably assign distinct smart types.
+        missing = [a for a in arrangements if "smart_name" not in a]
+        names = [a.get("name", "") for a in missing]
+        has_duplicates = len(names) != len(set(names))
+        if has_duplicates:
+            for a in missing:
+                a["smart_name"] = None
+        else:
+            # No duplicates — name-based fallback is safe.
+            from song import Arrangement as _ArrCls
+            arr_objs = [
+                _ArrCls(
+                    name=a.get("name", ""),
+                    path_lead=a.get("_path_lead", False),
+                    path_rhythm=a.get("_path_rhythm", False),
+                    path_bass=a.get("_path_bass", False),
+                    bonus_arr=a.get("_bonus_arr", False),
+                    represent=a.get("_represent", 0),
+                )
+                for a in arrangements
+            ]
+            smart = compute_smart_names(arr_objs)
+            for a, sn in zip(arrangements, smart):
+                if "smart_name" not in a:
+                    a["smart_name"] = sn
+
+    # Always sort by smart priority order so the client receives a consistent
+    # list regardless of how the DB row was originally stored.
+    # _arr_smart_sort_key is defined later in this module but resolved at
+    # call-time, so the forward reference is safe.
+    arrangements.sort(key=_arr_smart_sort_key)
     return arrangements
 
 
@@ -1732,6 +1760,13 @@ def _background_scan():
             log.warning("scan cache lookup failed for %s: %s", cache_key, e)
             cached = None
         if not cached:
+            to_scan.append((f, mtime, size))
+        elif cached.get("arrangements") and any(
+            "smart_name" not in a for a in cached["arrangements"]
+        ):
+            # Row was scanned before smart naming was introduced — force a
+            # rescan so the DB picks up authoritative path flags from the
+            # manifest JSON and stores correct smart_name values.
             to_scan.append((f, mtime, size))
 
     if not to_scan:
