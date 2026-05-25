@@ -3577,6 +3577,14 @@ function retuneSong(filename, title, tuning, target) {
 const audio = document.getElementById('audio');
 let isPlaying = false;
 
+function _applyPreservePitch(el) {
+    if (!el) return;
+    if ('preservesPitch' in el) el.preservesPitch = true;
+    if ('mozPreservesPitch' in el) el.mozPreservesPitch = true;
+    if ('webkitPreservesPitch' in el) el.webkitPreservesPitch = true;
+}
+_applyPreservePitch(audio);
+
 // In Slopsmith Desktop, WASAPI Exclusive Mode locks the audio device so Chromium
 // cannot play through it. When window._juceMode is true, song audio is routed
 // through the JUCE backing track player instead of the HTML5 <audio> element.
@@ -4311,6 +4319,7 @@ function _adjustSongVolume(delta) {
 // (slopsmith#54). Delegates to audio-mixer's readSongVolume when loaded so
 // the in-memory fallback (for storage-blocked contexts) is authoritative.
 audio.addEventListener('loadedmetadata', () => {
+    _applyPreservePitch(audio);
     const applySongVolume = window.slopsmith?.audio?.applySongVolume;
     if (typeof applySongVolume === 'function') {
         void applySongVolume();
@@ -4537,9 +4546,14 @@ function setSpeed(v) {
     }
     if (window._juceMode) {
         window.jucePlayer?.setRate(rate);
+        const juceAudio = window.slopsmithDesktop?.audio;
         Promise.resolve()
-            .then(() => window.slopsmithDesktop?.audio?.setBackingSpeed(rate))
-            .catch(err => console.warn('[setSpeed] setBackingSpeed failed:', err));
+            .then(() => juceAudio?.setBackingSpeed(rate))
+            // Match the HTML5 path: preserve pitch on the JUCE backing track too.
+            // Optional-chained call is a no-op on desktop builds that predate
+            // setBackingPreservePitch, so this is safe to ship unconditionally.
+            .then(() => juceAudio?.setBackingPreservePitch?.(true))
+            .catch(err => console.warn('[setSpeed] backing speed/preserve-pitch failed:', err));
     } else {
         audio.playbackRate = rate;
     }

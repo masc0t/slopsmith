@@ -442,6 +442,7 @@
                 if (_waCtx.state === 'suspended') _waCtx.resume();
                 _waSource = _waCtx.createBufferSource();
                 _waSource.buffer = _waBuffer;
+                // AudioBufferSourceNode has no preservesPitch equivalent so changing playbackRate here also changes pitch
                 _waSource.playbackRate.value = audioEl.playbackRate || 1;
                 _waSource.connect(_waCtx.destination);
                 _waStartTime = _waCtx.currentTime;
