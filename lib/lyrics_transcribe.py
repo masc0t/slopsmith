@@ -75,11 +75,28 @@ def whisperx_available() -> bool:
     Mirror of `demucs_available()` in `sloppak_convert.py`. The local
     transcription path imports whisperx lazily, so this probe lets
     callers gate on availability without paying the full import cost
-    (which transitively pulls torch and may try to initialize CUDA)."""
+    (which transitively pulls torch and may try to initialize CUDA).
+
+    Catches a broader exception set than just ImportError because
+    importing whisperx can fail with OSError (libsndfile or other
+    native libs missing), RuntimeError (torch CUDA init failure,
+    BLAS/LAPACK load problems), or essentially any exception the
+    deep transitive stack chooses to raise. The tests assert this
+    probe NEVER raises; falling back to False for any failure mode
+    keeps that contract while still surfacing the real error if a
+    later actual transcription tries to use the helper."""
     try:
         import whisperx  # noqa: F401
         return True
-    except ImportError:
+    except (ImportError, OSError, RuntimeError) as e:
+        log.debug("whisperx_available: import failed (%s)", e)
+        return False
+    except Exception as e:
+        # Last-resort catch so a transient/unexpected failure can't
+        # crash the caller. Logged at WARNING so it's visible in normal
+        # operation (vs the expected ImportError on installs without
+        # whisperx, which stays at DEBUG).
+        log.warning("whisperx_available: unexpected probe failure (%s)", e)
         return False
 
 

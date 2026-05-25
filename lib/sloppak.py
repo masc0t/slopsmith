@@ -299,9 +299,29 @@ def load_song(
                 if song.lyrics:
                     # Provenance — populated by the converter (xml/sng),
                     # the WhisperX fallback (whisperx), or hand-edits
-                    # (user). Falls back to "xml" on legacy sloppaks per
-                    # the spec's backward-compatibility note.
-                    song.lyrics_source = str(manifest.get("lyrics_source") or "xml")
+                    # (user). Validate against the closed enum so a
+                    # hand-edited (or otherwise malformed) manifest can't
+                    # propagate a YAML dict / list / arbitrary string
+                    # into the highway WS `lyrics.source` field and out
+                    # to plugin badges. Anything outside the enum (or
+                    # the wrong type) falls back to "xml" — the spec's
+                    # back-compat default — instead of being stringified
+                    # and trusted.
+                    _ALLOWED_LYRICS_SOURCES = {"xml", "sng", "whisperx", "user"}
+                    raw_source = manifest.get("lyrics_source")
+                    if isinstance(raw_source, str) and raw_source in _ALLOWED_LYRICS_SOURCES:
+                        song.lyrics_source = raw_source
+                    else:
+                        if raw_source is not None and (
+                            not isinstance(raw_source, str)
+                            or raw_source not in _ALLOWED_LYRICS_SOURCES
+                        ):
+                            log.warning(
+                                "sloppak: ignoring invalid lyrics_source %r — "
+                                "must be one of %s; falling back to 'xml'",
+                                raw_source, sorted(_ALLOWED_LYRICS_SOURCES),
+                            )
+                        song.lyrics_source = "xml"
             elif raw is not None:
                 log.warning("sloppak: lyrics %r ignored — expected list, got %s",
                             lyrics_rel, type(raw).__name__)

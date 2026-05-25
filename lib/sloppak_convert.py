@@ -870,11 +870,18 @@ def _existing_lyrics_path(source_dir: Path) -> Path | None:
     the `lyrics` key against `source_dir` with the same
     relative-to(source_dir) safety check the sloppak loader uses
     (lib/sloppak.py), and returns the path only when the file
-    actually exists on disk.
+    actually exists on disk and looks like a lyrics JSON.
+
+    Requires the resolved path to be a regular file with a `.json`
+    suffix — a manifest that points at a directory or a non-JSON
+    file is a broken manifest, and we'd rather let the transcribe
+    fallback fix it than treat the broken value as authoritative
+    "lyrics already present" and refuse to run.
 
     Returns None on any failure mode — no manifest, malformed YAML,
-    traversal attempt, missing key, missing file. Caller treats None
-    as "no existing lyrics — fallback path may run"."""
+    traversal attempt, missing key, missing file, wrong type. Caller
+    treats None as "no usable existing lyrics — fallback path may
+    run"."""
     mf = source_dir / "manifest.yaml"
     if not mf.exists():
         mf = source_dir / "manifest.yml"
@@ -895,7 +902,11 @@ def _existing_lyrics_path(source_dir: Path) -> Path | None:
         candidate.relative_to(source_dir.resolve())
     except (ValueError, OSError):
         return None
-    return candidate if candidate.exists() else None
+    if not candidate.is_file():
+        return None
+    if candidate.suffix.lower() != ".json":
+        return None
+    return candidate
 
 
 def _rewrite_lyrics_manifest(
