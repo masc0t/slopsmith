@@ -12,10 +12,13 @@ on-disk `lyrics.json` shape documented at `docs/sloppak-spec.md` §2.3:
     [{"t": float, "d": float, "w": str}, ...]
 
 `t` and `d` are seconds. `w` carries a `-` suffix when it joins to the
-following syllable; a bare `+` syllable marks a line break. WhisperX
-emits words, not syllables; the mapper inserts `+` line breaks on
-segment-gap heuristics and otherwise lets each word stand as its own
-syllable.
+following syllable, and a `+` suffix when it's the last syllable on a
+line (the frontend renderer in `static/highway.js` keys off
+`raw.endsWith('+')` and strips the suffix before drawing — see
+`docs/sloppak-spec.md` §2.3). Both markers are suffixes on real
+syllables, never standalone tokens. WhisperX emits words, not
+syllables; the mapper appends `+` to the previous word on segment-gap
+heuristics and otherwise lets each word stand as its own syllable.
 
 Engine selection
 ────────────────
