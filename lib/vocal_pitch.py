@@ -110,6 +110,8 @@ def extract_pitch_remote(
     # Wrap the upload so a connection / DNS / timeout failure becomes a
     # RuntimeError instead of leaking requests' own exception hierarchy
     # past the docstring contract.
+    log.debug("POST %s/pitch vocals=%s lyrics=%d timeout=%ds",
+              server_url, vocals_path.name, len(lyrics), timeout)
     try:
         with open(vocals_path, "rb") as f:
             resp = requests.post(
@@ -161,6 +163,8 @@ def extract_pitch_remote(
         except (TypeError, ValueError):
             continue
 
+    log.debug("CREPE /pitch returned %d raw notes, %d after normalization",
+              len(raw_notes), len(out))
     if progress_cb:
         try:
             progress_cb(1.0, "pitch", f"Got {len(out)} pitch notes")
