@@ -662,6 +662,38 @@ def _get_whisperx_config() -> dict:
     }
 
 
+def _get_pitch_config() -> dict:
+    """Return the karaoke pitch-extraction sub-config from converter config.
+
+    Shape (all keys optional, defaults applied here):
+
+        {
+          "enabled": bool,         # default False — opt-in
+          "server_url": str | None,  # default None → fall back to demucs_server_url
+          "api_key": str | None,
+        }
+
+    When `server_url` is unset, callers fall through to
+    `_get_demucs_server_url()` — same pattern WhisperX uses, since the
+    same demucs server hosts the `/pitch` endpoint alongside `/separate`
+    and `/align`."""
+    cfg = _load_converter_config()
+    raw = cfg.get("pitch_extraction")
+    if not isinstance(raw, dict):
+        raw = {}
+    server_url = raw.get("server_url")
+    if isinstance(server_url, str):
+        server_url = server_url.rstrip("/") or None
+    else:
+        server_url = None
+    api_key = raw.get("api_key") if isinstance(raw.get("api_key"), str) else None
+    return {
+        "enabled": _coerce_bool(raw.get("enabled"), False),
+        "server_url": server_url,
+        "api_key": api_key or None,
+    }
+
+
 def _run_demucs_remote(full_ogg: Path, out_dir: Path, model: str) -> Path:
     """Run stem separation via remote demucs server."""
     import json
@@ -1119,6 +1151,139 @@ def _maybe_transcribe_lyrics(
     _progress(progress_cb, base_frac + span_frac, "transcribing",
               f"Wrote {len(lyrics)} lyric tokens")
     log.info("_maybe_transcribe_lyrics: wrote %d tokens to %s", len(lyrics), lyrics_path)
+
+    # Karaoke pitch extraction is the natural next step now that we
+    # have BOTH a vocal stem AND syllable-level lyric timings. Best-
+    # effort: failures must not undo the lyric write we just persisted.
+    _maybe_extract_pitch(source_dir, lyrics, vocals_path)
+    return True
+
+
+def _rewrite_pitch_manifest(
+    source_dir: Path,
+    pitch_rel: str,
+    *,
+    extraction: dict | None,
+) -> None:
+    """Set `vocal_pitch` + optional `pitch_extraction` block on the manifest.
+
+    Used by `_maybe_extract_pitch` after writing a fresh
+    `vocal_pitch.json`. Caller is responsible for having written the
+    file at `source_dir / pitch_rel` already.
+
+    `extraction` is the optional `pitch_extraction` provenance block
+    (engine / model / version) per the same shape `stem_separation`
+    and `lyric_transcription` use. Pass it when pitch came from an
+    automated engine (currently `crepe` via the demucs server); omit
+    for hand-edited pitch tracks. Passing `None` removes any existing
+    `pitch_extraction` key so a hand-edit doesn't inherit stale
+    auto-generated provenance."""
+    mf = source_dir / "manifest.yaml"
+    if not mf.exists():
+        mf = source_dir / "manifest.yml"
+    data = yaml.safe_load(mf.read_text(encoding="utf-8")) or {}
+    data["vocal_pitch"] = pitch_rel
+    if extraction is not None:
+        data["pitch_extraction"] = extraction
+    else:
+        data.pop("pitch_extraction", None)
+    mf.write_text(
+        yaml.safe_dump(data, sort_keys=False, allow_unicode=True),
+        encoding="utf-8",
+    )
+
+
+def _maybe_extract_pitch(
+    source_dir: Path,
+    lyrics: list[dict],
+    vocals_path: Path,
+) -> bool:
+    """Per-syllable pitch extraction via the demucs server's /pitch endpoint.
+
+    Best-effort sibling to `_maybe_transcribe_lyrics`. Fires when:
+      1. `pitch_extraction.enabled` is True in converter config.
+      2. We have a vocal stem on disk (caller guarantees this — we're
+         called right after `_maybe_transcribe_lyrics` succeeded).
+      3. We have at least one lyric token (the endpoint needs timings).
+      4. A server URL is configured (either `pitch_extraction.server_url`
+         or the shared `demucs_server_url`). Local CREPE is deferred.
+
+    On success writes `vocal_pitch.json` (shape matches what
+    byrongamatos/slopsmith-plugin-lyrics-karaoke renders:
+    `{"version": 1, "notes": [{"t","d","midi"}, ...]}`) and adds
+    `vocal_pitch` + `pitch_extraction` keys to the manifest. On any
+    failure logs a warning and returns False — must NOT undo the
+    lyric write the surrounding transcription path already persisted."""
+    cfg = _get_pitch_config()
+    if not cfg["enabled"]:
+        log.debug("_maybe_extract_pitch: pitch_extraction.enabled=False — skipping")
+        return False
+    if not lyrics:
+        log.debug("_maybe_extract_pitch: no lyrics — nothing to time pitch against")
+        return False
+    if not vocals_path.exists():
+        log.debug("_maybe_extract_pitch: vocals stem missing — skipping")
+        return False
+
+    # Server URL precedence: explicit pitch_extraction.server_url first,
+    # else fall back to the shared demucs server (which hosts /pitch
+    # alongside /separate and /align).
+    server_url = cfg["server_url"] or _get_demucs_server_url()
+    if not server_url:
+        log.info("_maybe_extract_pitch: no server configured "
+                 "(pitch_extraction.server_url / demucs_server_url) — skipping. "
+                 "Local CREPE fallback not yet implemented.")
+        return False
+
+    try:
+        from vocal_pitch import (
+            extract_pitch_remote,
+            PITCH_EXTRACTION_ENGINE,
+            PITCH_EXTRACTION_MODEL,
+            PITCH_EXTRACTION_SCHEMA_VERSION,
+        )
+    except ImportError as e:
+        log.warning("_maybe_extract_pitch: vocal_pitch import failed: %s", e)
+        return False
+
+    try:
+        notes = extract_pitch_remote(
+            vocals_path, lyrics, server_url, api_key=cfg["api_key"],
+        )
+    except Exception as e:
+        log.warning("_maybe_extract_pitch: pitch extraction failed for %s: %s",
+                    source_dir.name, e, exc_info=True)
+        return False
+
+    if not notes:
+        log.info("_maybe_extract_pitch: %s produced no notes", source_dir.name)
+        return False
+
+    pitch_path = source_dir / "vocal_pitch.json"
+    pitch_payload = {"version": 1, "notes": notes}
+    extraction_meta = {
+        "engine": PITCH_EXTRACTION_ENGINE,
+        "model": PITCH_EXTRACTION_MODEL,
+        "version": PITCH_EXTRACTION_SCHEMA_VERSION,
+    }
+    try:
+        pitch_path.write_text(
+            json.dumps(pitch_payload, separators=(",", ":")), encoding="utf-8"
+        )
+        _rewrite_pitch_manifest(
+            source_dir, "vocal_pitch.json", extraction=extraction_meta,
+        )
+    except Exception as e:
+        log.warning("_maybe_extract_pitch: failed to persist pitch for %s: %s",
+                    source_dir.name, e, exc_info=True)
+        if pitch_path.exists():
+            try:
+                pitch_path.unlink()
+            except OSError:
+                pass
+        return False
+
+    log.info("_maybe_extract_pitch: wrote %d notes to %s", len(notes), pitch_path)
     return True
 
 
