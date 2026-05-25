@@ -28,6 +28,8 @@ log = logging.getLogger("slopsmith.lib.patcher")
 
 from Crypto.Cipher import AES
 
+from safepath import safe_join
+
 # PSARC constants
 MAGIC = b"PSAR"
 BLOCK_SIZE = 65536
@@ -128,18 +130,35 @@ def unpack_psarc(filepath, output_dir):
         file_list_data = extract_entry(f, entries[0], block_sizes, block_size)
         filenames = file_list_data.decode('utf-8', errors='ignore').strip().split('\n')
 
-        output_dir = Path(output_dir)
+        output_dir = Path(output_dir).resolve()
         for entry, filename in zip(entries[1:], filenames):
             filename = filename.strip()
             if not filename:
                 continue
-            outpath = output_dir / filename
-            outpath.parent.mkdir(parents=True, exist_ok=True)
+            outpath = safe_join(output_dir, filename)
+            if outpath is None:
+                log.warning("patcher: rejected unsafe entry path %r", filename)
+                continue
+            if outpath == output_dir:
+                log.warning("patcher: rejected entry resolving to output root %r", filename)
+                continue
             try:
+                # mkdir inside the try: a benign "subdir" data entry followed
+                # by "subdir/file.txt" raises FileExistsError otherwise and
+                # aborts the whole patch unpack.
+                outpath.parent.mkdir(parents=True, exist_ok=True)
                 data = extract_entry(f, entry, block_sizes, block_size)
                 outpath.write_bytes(data)
             except Exception as e:
-                outpath.write_bytes(b'')
+                # Preserve historical patcher fallback: leave an empty
+                # placeholder so the surrounding patch flow can still replace
+                # it. Suppress secondary errors (e.g. mkdir failed → no parent
+                # dir for the placeholder) so one bad entry can't abort.
+                log.warning("patcher: failed to extract %r: %s", filename, e)
+                try:
+                    outpath.write_bytes(b'')
+                except OSError:
+                    pass
 
 
 def pack_psarc(input_dir, output_path):

@@ -30,6 +30,7 @@ log = logging.getLogger("slopsmith.lib.sloppak_convert")
 import yaml
 
 from patcher import unpack_psarc
+from sloppak import _unpack_zip as _unpack_sloppak_zip
 from song import load_song, arrangement_to_wire
 from tones import extract_tones_for_song
 from audio import find_wem_files, _vgmstream_cmd, _ffmpeg_cmd, _ffmpeg_wav_to_ogg
@@ -816,9 +817,10 @@ def split_sloppak_stems(
     # Zip form: unpack, split, re-zip atomically.
     with tempfile.TemporaryDirectory(prefix="s2p_split_zip_") as td:
         work = Path(td) / "sloppak"
-        work.mkdir()
-        with zipfile.ZipFile(str(sloppak_path), "r") as zf:
-            zf.extractall(work)
+        # Delegate to sloppak's hardened unpack so the convert/split path
+        # gets the same zip-slip containment as the player upload path
+        # (safe_join per member, root-rejection, per-member fallback).
+        _unpack_sloppak_zip(sloppak_path, work)
 
         _split_in_dir(work, model, progress_cb, base_frac, span_frac * 0.9)
 

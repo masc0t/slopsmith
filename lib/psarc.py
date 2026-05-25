@@ -6,6 +6,8 @@ import struct
 import zlib
 from pathlib import Path
 
+from safepath import safe_join
+
 log = logging.getLogger("slopsmith.lib.psarc")
 
 try:
@@ -134,20 +136,34 @@ def read_psarc_entries(filepath: str, patterns: list[str] | None = None) -> dict
 
 
 def unpack_psarc(filepath: str, output_dir: str) -> list[str]:
-    """Extract a PSARC archive. Returns list of extracted file paths."""
+    """Extract a PSARC archive. Returns list of extracted file paths.
+
+    Entries whose TOC filename escapes ``output_dir`` via ``..`` segments,
+    absolute paths, or Windows-style separators are skipped with a warning.
+    """
     extracted = []
 
     with open(filepath, "rb") as f:
         entries, filenames, block_sizes, block_size = _parse_toc(f)
 
-        out = Path(output_dir)
+        out = Path(output_dir).resolve()
         for entry, filename in zip(entries[1:], filenames):
             filename = filename.strip()
             if not filename:
                 continue
-            outpath = out / filename
-            outpath.parent.mkdir(parents=True, exist_ok=True)
+            outpath = safe_join(out, filename)
+            if outpath is None:
+                log.warning("psarc: rejected unsafe entry path %r", filename)
+                continue
+            if outpath == out:
+                log.warning("psarc: rejected entry resolving to output root %r", filename)
+                continue
             try:
+                # Inside the try: a benign "subdir" data entry followed by a
+                # "subdir/file.txt" entry can hit FileExistsError when the
+                # parent already exists as a file. Skip the bad entry, keep
+                # extracting the rest.
+                outpath.parent.mkdir(parents=True, exist_ok=True)
                 data = _extract_entry(f, entry, block_sizes, block_size)
                 outpath.write_bytes(data)
                 extracted.append(str(outpath))

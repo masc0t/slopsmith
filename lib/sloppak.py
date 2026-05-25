@@ -25,6 +25,7 @@ log = logging.getLogger("slopsmith.lib.sloppak")
 
 import yaml
 
+from safepath import safe_join
 from song import (
     Song,
     Beat,
@@ -52,12 +53,38 @@ _source_lock = threading.Lock()
 
 
 def _unpack_zip(zip_path: Path, dest: Path) -> None:
-    """Extract a sloppak zip archive into dest, replacing any previous contents."""
+    """Extract a sloppak zip archive into dest, replacing any previous contents.
+
+    Members whose names escape ``dest`` via ``..`` segments, absolute paths, or
+    Windows-style separators are skipped with a warning so a crafted sloppak
+    can't write outside the unpack cache (zip-slip).
+    """
     if dest.exists():
         shutil.rmtree(dest, ignore_errors=True)
     dest.mkdir(parents=True, exist_ok=True)
+    dest_resolved = dest.resolve()
     with zipfile.ZipFile(str(zip_path), "r") as zf:
-        zf.extractall(str(dest))
+        for member in zf.infolist():
+            target = safe_join(dest_resolved, member.filename)
+            if target is None:
+                log.warning("sloppak: rejected unsafe zip member %r", member.filename)
+                continue
+            # A contained-but-degenerate name (e.g. "." or "subdir/..") would
+            # resolve back to the unpack root itself; opening that path for
+            # write is meaningless and would mask a real bug, so skip it.
+            if target == dest_resolved:
+                log.warning("sloppak: rejected zip member resolving to unpack root %r", member.filename)
+                continue
+            try:
+                if member.is_dir():
+                    target.mkdir(parents=True, exist_ok=True)
+                    continue
+                target.parent.mkdir(parents=True, exist_ok=True)
+                with zf.open(member) as src, open(target, "wb") as dst:
+                    shutil.copyfileobj(src, dst)
+            except (OSError, zipfile.BadZipFile, RuntimeError, NotImplementedError) as e:
+                log.warning("sloppak: failed to extract zip member %r: %s", member.filename, e)
+                continue
 
 
 def _safe_id(filename: str) -> str:

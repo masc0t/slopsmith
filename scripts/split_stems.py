@@ -40,6 +40,7 @@ _ROOT = _HERE.parent
 sys.path.insert(0, str(_ROOT / "lib"))
 
 from audio import _ffmpeg_cmd, _ffmpeg_wav_to_ogg  # noqa: E402
+from sloppak import _unpack_zip as _unpack_sloppak_zip  # noqa: E402
 
 
 # Demucs outputs WAVs named {stem}.wav in a per-track subfolder. We re-encode
@@ -156,9 +157,9 @@ def split(sloppak_path: Path, model: str) -> None:
     print(f"[*] Unpacking {sloppak_path.name}")
     with tempfile.TemporaryDirectory(prefix="split_stems_zip_") as td:
         work = Path(td) / "sloppak"
-        work.mkdir()
-        with zipfile.ZipFile(str(sloppak_path), "r") as zf:
-            zf.extractall(work)
+        # Share the hardened sloppak unpack so this CLI gets the same
+        # zip-slip containment as the player upload + convert paths.
+        _unpack_sloppak_zip(sloppak_path, work)
 
         _split_in_dir(work, model)
 

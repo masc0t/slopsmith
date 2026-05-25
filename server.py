@@ -23,6 +23,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response, StreamingResponse
 
 from psarc import unpack_psarc, read_psarc_entries
+from safepath import safe_join
 from song import (
     anchor_to_wire,
     arrangement_string_count,
@@ -1187,14 +1188,7 @@ def _resolve_dlc_path(dlc: Path, filename: str) -> Path | None:
     Returns the validated resolved Path, or None if the path is empty
     or escapes the DLC root.
     """
-    if not filename:
-        return None
-    try:
-        resolved = (dlc / filename).resolve()
-        resolved.relative_to(dlc.resolve())
-    except (ValueError, OSError):
-        return None
-    return resolved
+    return safe_join(dlc, filename)
 
 
 def _sanitized_song_offset(song) -> float:
