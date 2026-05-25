@@ -18,8 +18,10 @@ Behaviour by input state:
                                           opt-out via this flag). On
                                           overwrite, the fresh transcript
                                           always lands at canonical
-                                          stems/lyrics.json and the
-                                          manifest gets repointed.
+                                          <sloppak>/lyrics.json (sloppak
+                                          root, not under stems/) and the
+                                          manifest's `lyrics:` key gets
+                                          repointed.
 
 Requires whisperx for the local path, or a configured remote demucs server
 (which hosts /align too) via $CONFIG_DIR/config.json:
@@ -74,9 +76,11 @@ def _process_one(path: Path, *, force: bool, model: str) -> int:
     # transcribe_existing_sloppak returns False for any non-success path:
     # existing lyrics + no force, instrumental, missing whisperx, remote
     # server failure, no tokens after filtering. The underlying reason is
-    # logged via slopsmith.lib.* (basicConfig wires those to stdout in
-    # main()), so keep this surface message generic and point users at
-    # the log lines for specifics.
+    # logged via slopsmith.lib.* (basicConfig wires those to stderr in
+    # main() — the stdlib default; progress printer above writes stdout).
+    # The two streams interleave on an attached terminal; redirecting
+    # stderr separates them. Keep this surface message generic and point
+    # users at the log lines for specifics.
     print(f"[--] {path.name}: no lyrics written — see log above for reason")
     return 0
 
