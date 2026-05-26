@@ -272,14 +272,17 @@ def _ensure_smart_names(arrangements: list[dict]) -> list[dict]:
 
     # Fill in missing smart_name values.
     if not all("smart_name" in a for a in arrangements):
-        # Detect duplicate raw names among the missing entries.  Duplicates mean
-        # the name-based fallback cannot reliably assign distinct smart types.
-        missing = [a for a in arrangements if "smart_name" not in a]
-        names = [a.get("name", "") for a in missing]
-        has_duplicates = len(names) != len(set(names))
+        # Detect duplicate raw names across ALL arrangements (not just the
+        # missing subset).  A duplicate anywhere means the name-based fallback
+        # may assign the same smart type a scanned row already owns — emit
+        # None for the missing entries and let the legacy name show through
+        # until the background rescan corrects them.
+        all_names = [a.get("name", "") for a in arrangements]
+        has_duplicates = len(all_names) != len(set(all_names))
         if has_duplicates:
-            for a in missing:
-                a["smart_name"] = None
+            for a in arrangements:
+                if "smart_name" not in a:
+                    a["smart_name"] = None
         else:
             # No duplicates — name-based fallback is safe.
             from song import Arrangement as _ArrCls
@@ -1048,6 +1051,9 @@ def _require_library_provider_capability(provider: object, capability: str) -> N
     )
 
 
+_OPTIONAL_NEW_PROVIDER_KWARGS = ("naming_mode",)
+
+
 def _filter_provider_kwargs(method: object, kwargs: dict) -> dict:
     """Drop kwargs that the method's signature does not declare.
 
@@ -1055,6 +1061,11 @@ def _filter_provider_kwargs(method: object, kwargs: dict) -> dict:
     query_page/query_artists/query_stats methods were written before
     naming_mode was added — calling them with the extra kwarg would
     raise TypeError and return a 500 to the client.
+
+    When ``inspect.signature`` cannot introspect the method (rare: C
+    extensions / built-ins / exotic callables), fall back to stripping
+    only the kwargs we know were added later — older providers won't
+    accept them, anything else stays so the call still works.
     """
     try:
         sig = inspect.signature(method)  # type: ignore[arg-type]
@@ -1063,7 +1074,7 @@ def _filter_provider_kwargs(method: object, kwargs: dict) -> dict:
                 return kwargs  # method accepts **kwargs, pass everything
         return {k: v for k, v in kwargs.items() if k in sig.parameters}
     except (ValueError, TypeError):
-        return kwargs
+        return {k: v for k, v in kwargs.items() if k not in _OPTIONAL_NEW_PROVIDER_KWARGS}
 
 
 def _call_library_provider(provider: object, method_name: str, **kwargs) -> Any:

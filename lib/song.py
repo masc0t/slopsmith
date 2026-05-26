@@ -445,14 +445,16 @@ def compute_smart_names(arrangements: list[Arrangement]) -> list[str | None]:
     """Compute smart display names for arrangements based on RS XML path flags.
 
     Returns a list parallel to `arrangements`. Each entry is a descriptive
-    name like "Lead", "Alt. Lead", "Bonus Rhythm", "Bass", or None when no
-    type can be determined (sloppak / GP-imported sources, Vocals, etc.).
+    name like "Lead", "Alt. Lead", "Bonus Rhythm", "Bass", or None for
+    non-instrument arrangements (Vocals, ShowLights) and unrecognised
+    names whose path flags are all zero.
 
     Path-type resolution (first match wins):
     1. XML <arrangementProperties> flags (path_lead / path_rhythm / path_bass)
-    2. Name-based fallback when ALL three flags are zero — handles CDLC where
-       authoring tools leave the flags unset. "Combo" is treated as Lead since
-       it is a guitar arrangement. Anything else (Vocals, ShowLights, …) → None.
+    2. Name-based fallback when ALL three flags are zero — keeps sloppak /
+       GP-imported sources and CDLC with unset flags working by mapping
+       "Lead" / "Rhythm" / "Bass" / "Combo" → the matching path. Anything
+       outside that set (Vocals, ShowLights, …) → None.
 
     Naming rules per path type (Lead / Rhythm / Bass):
     - Main group (bonusArr=False), sorted by represent ascending:
