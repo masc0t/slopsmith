@@ -1299,12 +1299,20 @@ let _libEpoch = 0;
 // SQL doesn't have to encode the third "any" state.
 // In smart mode Combo is subsumed into Lead; only show Lead/Rhythm/Bass.
 // In legacy mode keep the original four values.
+// In-memory cache so a localStorage.setItem failure (private mode / quota /
+// disabled storage) still keeps the chosen mode for the rest of the session.
+// Initialised lazily from localStorage on first read.
+let _arrangementNamingMode = null;
 function _getArrangementNamingMode() {
-    try {
-        return localStorage.getItem('arrangementNamingMode') === 'legacy' ? 'legacy' : 'smart';
-    } catch (_) {
-        return 'smart';
+    if (_arrangementNamingMode === 'smart' || _arrangementNamingMode === 'legacy') {
+        return _arrangementNamingMode;
     }
+    try {
+        _arrangementNamingMode = localStorage.getItem('arrangementNamingMode') === 'legacy' ? 'legacy' : 'smart';
+    } catch (_) {
+        _arrangementNamingMode = 'smart';
+    }
+    return _arrangementNamingMode;
 }
 // In smart mode 'Combo' is subsumed into 'Lead' (_ensure_smart_names maps it
 // the same way). Normalize any persisted 'Combo' tokens before querying or
@@ -1313,8 +1321,10 @@ function _toSmartArrs(arr) {
     return arr.map(a => a === 'Combo' ? 'Lead' : a);
 }
 function _onNamingModeChange(value) {
-    try { localStorage.setItem('arrangementNamingMode', value); } catch (_) {}
-    if (value === 'smart') {
+    const mode = value === 'legacy' ? 'legacy' : 'smart';
+    _arrangementNamingMode = mode;
+    try { localStorage.setItem('arrangementNamingMode', mode); } catch (_) {}
+    if (mode === 'smart') {
         _libFilters.arrHas   = _toSmartArrs(_libFilters.arrHas);
         _libFilters.arrLacks = _toSmartArrs(_libFilters.arrLacks);
         _saveLibFilters();
