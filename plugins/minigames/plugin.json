@@ -12,5 +12,10 @@
       "minigames/"
     ]
   },
+  "diagnostics": {
+    "server_files": [
+      "minigames/profile.json"
+    ]
+  },
   "routes": "routes.py"
 }

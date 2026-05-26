@@ -43,6 +43,12 @@ _state = {
 _REGISTRY_TTL_S = 10
 _registry_cache: dict = {"ts": 0.0, "data": []}
 
+# Maximum byte-length of the serialised `modifiers` and `meta` JSON fields on a
+# run submission.  Prevents a single call from bloating runs.db with arbitrary
+# payload (32 KB is generous for game-side metadata, while still being a
+# concrete limit).
+_MAX_RUN_JSON_BYTES = 32 * 1024
+
 
 # ── XP / level math ───────────────────────────────────────────────────────────
 
@@ -218,7 +224,10 @@ def _list_minigame_plugins(force_refresh: bool = False) -> list:
             continue
         try:
             data = json.loads(manifest_path.read_text(encoding="utf-8"))
-        except Exception:
+        except (OSError, ValueError) as e:
+            _state["log"].warning(
+                "failed to parse minigame manifest at %s: %s", manifest_path, e
+            )
             continue
         if not isinstance(data, dict):
             continue
@@ -325,6 +334,19 @@ def setup(app, context):
             log.warning("run submitted for unknown game_id=%s; accepting anyway",
                         submission.game_id)
 
+        # Serialise modifiers + meta up-front so we can enforce the byte-size cap
+        # before touching the database.
+        try:
+            modifiers_json = json.dumps(submission.modifiers, separators=(",", ":"))
+            meta_json      = json.dumps(submission.meta,      separators=(",", ":"))
+        except (TypeError, ValueError) as e:
+            raise HTTPException(status_code=400,
+                                detail="modifiers/meta must be JSON-serialisable objects") from e
+        if (len(modifiers_json.encode("utf-8")) > _MAX_RUN_JSON_BYTES
+                or len(meta_json.encode("utf-8")) > _MAX_RUN_JSON_BYTES):
+            raise HTTPException(status_code=400,
+                                detail=f"modifiers/meta too large (max {_MAX_RUN_JSON_BYTES} bytes each)")
+
         xp_gained = xp_for_run(submission.score)
         created_at = int(time.time())
 
@@ -339,8 +361,8 @@ def setup(app, context):
                         submission.game_id,
                         submission.score,
                         submission.duration_ms,
-                        json.dumps(submission.modifiers, separators=(",", ":")),
-                        json.dumps(submission.meta,      separators=(",", ":")),
+                        modifiers_json,
+                        meta_json,
                         xp_gained,
                         created_at,
                     ),

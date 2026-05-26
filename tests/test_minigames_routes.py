@@ -135,6 +135,26 @@ def test_submit_run_cross_game_totals_isolated(setup_routes):
     assert totals["game-b"]["runs"] == 1
 
 
+def test_submit_run_oversized_modifiers_rejected(setup_routes):
+    """modifiers/meta payloads exceeding _MAX_RUN_JSON_BYTES are rejected 400."""
+    client, routes = setup_routes
+    cap = routes._MAX_RUN_JSON_BYTES
+    # Build a dict whose serialised size just exceeds the cap.
+    oversized = {"k": "x" * (cap + 1)}
+    r = client.post(
+        "/api/plugins/minigames/runs",
+        json={"game_id": "g", "score": 10, "duration_ms": 0, "modifiers": oversized},
+    )
+    assert r.status_code == 400
+
+
+def test_submit_run_within_size_limit_accepted(setup_routes):
+    """Payloads well within the cap are accepted normally."""
+    client, _ = setup_routes
+    r = _submit(client, modifiers={"key": "value"}, meta={"info": "ok"})
+    assert r.status_code == 200
+
+
 # ── Leaderboard ordering and limits ──────────────────────────────────────────
 
 def test_list_runs_ordered_by_score_desc(setup_routes):

@@ -851,10 +851,36 @@
   // Slopsmith mounts plugin screens with id "plugin-<plugin_id>" and
   // routes there via showScreen() / window.slopsmith.navigate().
   const SCREEN_ID = `plugin-${PLUGIN_ID}`;
+  // Non-scoring teardown: called when navigation happens mid-run so that
+  // microphone streams, timers, and stage DOM are cleaned up without submitting
+  // a zero-score run.
+  async function teardownActiveSession(reason) {
+    if (!active && !starting) return;
+    const spec = active && active.spec;
+    active   = null;
+    starting = false;
+    try { if (spec && typeof spec.stop === 'function') await spec.stop(); } catch (e) { console.error('[minigames] teardown spec.stop failed:', e); }
+    _timers.forEach(t => { clearTimeout(t); clearInterval(t); });
+    _timers.clear();
+    const stage = document.getElementById('mg-stage');
+    if (stage) stage.classList.add('hidden');
+    const stageBody = document.getElementById('mg-stage-body');
+    if (stageBody) stageBody.innerHTML = '';
+    const summaryEl = document.getElementById('mg-summary');
+    if (summaryEl) summaryEl.classList.add('hidden');
+    console.info('[minigames] active session torn down (reason=' + reason + ')');
+  }
+
   if (window.slopsmith && typeof window.slopsmith.on === 'function') {
     window.slopsmith.on('screen:changed', (e) => {
       const id = e && e.detail && e.detail.id;
-      if (id === SCREEN_ID) renderHub();
+      if (id === SCREEN_ID) {
+        renderHub();
+      } else if (active || starting) {
+        teardownActiveSession('screen-changed').catch((err) => {
+          console.error('[minigames] teardown failed:', err);
+        });
+      }
     });
   }
   // Initial render in case the DOM is already mounted (hot reload / direct load).
