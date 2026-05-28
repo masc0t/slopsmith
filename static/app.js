@@ -2393,6 +2393,71 @@ function goFavTreePage(p) {
 }
 
 // ── Settings ─────────────────────────────────────────────────────────────
+let _defaultArrangement = '';
+
+function _syncDefaultArrangementSelect(value) {
+    const sel = document.getElementById('default-arrangement');
+    if (!sel) return;
+    const wanted = value || '';
+    const existing = Array.from(sel.options).find(opt => opt.value === wanted);
+    const dynamic = sel.querySelector('option[data-dynamic-default-arrangement]');
+    if (dynamic && dynamic.value !== wanted) dynamic.remove();
+    if (wanted && !existing) {
+        const opt = document.createElement('option');
+        opt.value = wanted;
+        opt.textContent = `${wanted} (saved default)`;
+        opt.dataset.dynamicDefaultArrangement = 'true';
+        sel.appendChild(opt);
+    }
+    sel.value = wanted;
+}
+
+function _currentArrangementName() {
+    const song = window.slopsmith?.currentSong;
+    const sel = document.getElementById('arr-select');
+    if (song?.arrangements && sel) {
+        const match = song.arrangements.find(a => String(a.index) === String(sel.value));
+        if (match?.name) return String(match.name);
+    }
+    if (song?.arrangement) return String(song.arrangement);
+    const selectedText = sel?.selectedOptions?.[0]?.textContent || '';
+    return selectedText.replace(/\s*\([^)]*\)\s*$/, '').trim();
+}
+
+function syncDefaultArrangementPin() {
+    const btn = document.getElementById('arr-default-pin');
+    if (!btn) return;
+    const name = _currentArrangementName();
+    const isDefault = !!name && name === _defaultArrangement;
+    const label = name
+        ? (isDefault ? `${name} is the default arrangement` : `Make ${name} the default for new songs`)
+        : 'Select an arrangement to make it the default';
+    btn.textContent = isDefault ? '★' : '☆';
+    btn.setAttribute('aria-pressed', isDefault ? 'true' : 'false');
+    btn.setAttribute('aria-label', label);
+    btn.disabled = !name;
+    btn.classList.toggle('text-yellow-300', isDefault);
+    btn.classList.toggle('text-gray-400', !isDefault);
+    btn.title = label;
+}
+
+async function pinCurrentArrangementDefault() {
+    const name = _currentArrangementName();
+    if (!name || name === _defaultArrangement) {
+        syncDefaultArrangementPin();
+        return;
+    }
+    const resp = await fetch('/api/settings', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ default_arrangement: name }),
+    });
+    if (!resp.ok) return;
+    _defaultArrangement = name;
+    _syncDefaultArrangementSelect(name);
+    syncDefaultArrangementPin();
+}
+
 async function loadSettings() {
     // App Updates UI does not depend on /api/settings — run it first so a
     // failed fetch below still leaves the desktop updater wired up.
@@ -2401,7 +2466,8 @@ async function loadSettings() {
     const resp = await fetch('/api/settings');
     const data = await resp.json();
     document.getElementById('dlc-path').value = data.dlc_dir || '';
-    document.getElementById('default-arrangement').value = data.default_arrangement || '';
+    _defaultArrangement = data.default_arrangement || '';
+    _syncDefaultArrangementSelect(_defaultArrangement);
     document.getElementById('demucs-server-url').value = data.demucs_server_url || '';
     const leftyEl = document.getElementById('setting-lefty');
     if (leftyEl) leftyEl.checked = highway.getLefty();
@@ -2433,6 +2499,7 @@ async function loadSettings() {
     if (window.slopsmithDesktop && typeof window.slopsmithDesktop.pickDirectory === 'function') {
         document.getElementById('btn-pick-dlc')?.classList.remove('hidden');
     }
+    syncDefaultArrangementPin();
 }
 
 // ── App Updates (desktop-only) ───────────────────────────────────────────
@@ -2826,20 +2893,28 @@ async function pickDlcFolder() {
 }
 
 async function saveSettings() {
+    const defaultArrangement = document.getElementById('default-arrangement').value;
     const resp = await fetch('/api/settings', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
             dlc_dir: document.getElementById('dlc-path').value.trim(),
-            default_arrangement: document.getElementById('default-arrangement').value,
+            default_arrangement: defaultArrangement,
             demucs_server_url: document.getElementById('demucs-server-url').value.trim(),
             av_offset_ms: _avOffsetMs,
             psarc_platform: document.getElementById('psarc-platform')?.value || 'both',
         }),
     });
     const data = await resp.json();
+    if (resp.ok) {
+        _defaultArrangement = defaultArrangement;
+        _syncDefaultArrangementSelect(_defaultArrangement);
+        syncDefaultArrangementPin();
+    }
     document.getElementById('settings-status').textContent = data.message || data.error;
 }
+
+document.getElementById('arr-select')?.addEventListener('change', syncDefaultArrangementPin);
 
 // Persist a single settings field the instant a control changes (used by
 // the Settings dropdowns). The /api/settings POST handler merges only the
@@ -4765,6 +4840,8 @@ function _applyMasteryAvailability(hasPhraseData) {
     }
 }
 if (window.slopsmith) {
+    window.slopsmith.on('song:loaded', syncDefaultArrangementPin);
+    window.slopsmith.on('arrangement:changed', syncDefaultArrangementPin);
     // slopsmith's event bus dispatches CustomEvent with the payload in
     // event.detail (see EventTarget setup around line 699), so the
     // handler receives an Event, not the raw payload.

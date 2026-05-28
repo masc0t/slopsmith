@@ -294,7 +294,7 @@
                             <select id="default-arrangement"
                                 onchange="persistSetting('default_arrangement', this.value)"
                                 class="bg-dark-700 border border-gray-800 rounded-xl px-3 py-2.5 text-sm text-gray-300 outline-none">
-                                <option value="">Auto (most notes)</option>
+                                <option value="">Most notes (auto)</option>
                                 <option value="Lead">Lead</option>
                                 <option value="Rhythm">Rhythm</option>
                                 <option value="Bass">Bass</option>
@@ -490,6 +490,7 @@
             <button onclick="togglePlay()" id="btn-play" class="px-4 py-1.5 bg-accent hover:bg-accent-light rounded-lg text-xs font-semibold text-white transition" aria-label="Play" title="Play" aria-pressed="false"><img src="/static/svg/play.svg" class="button-icon-svg" alt="" aria-hidden="true" /></button>
             <button onclick="seekBy(5)" class="px-3 py-1.5 bg-dark-600 hover:bg-dark-500 rounded-lg text-xs text-gray-300 transition" title="Seek Forward 5s" aria-label="Seek Forward 5s">5s <img src="/static/svg/ff.svg" class="button-icon-svg" alt="" aria-hidden="true" /></button>
             <select id="arr-select" onchange="changeArrangement(this.value)" class="bg-dark-600 border border-gray-700 rounded-lg px-2 py-1.5 text-xs text-gray-300 outline-none max-w-[130px]"></select>
+            <button id="arr-default-pin" type="button" onclick="pinCurrentArrangementDefault()" aria-pressed="false" aria-label="Select an arrangement to make it the default" class="w-8 h-8 inline-flex items-center justify-center bg-dark-600 border border-gray-700 hover:bg-dark-500 rounded-lg text-xs text-gray-400 transition" title="Select an arrangement to make it the default">☆</button>
             <input type="range" id="speed-slider" min="25" max="150" value="100" step="5" oninput="setSpeed(this.value/100)" class="w-20 accent-accent slider-input">
             <span id="speed-label" class="text-xs text-gray-500 w-10">1.0x</span>
             <span id="mastery-slider-label" class="text-xs text-gray-500 ml-1">Difficulty</span>
