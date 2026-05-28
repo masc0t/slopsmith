@@ -1756,10 +1756,18 @@ def _background_scan():
     # path isn't shared. Report the failure explicitly rather than silently
     # appearing to scan nothing.
     try:
+        # Tutorial exercise sloppaks are copied into DLC_DIR/tutorials-builtin/
+        # by the tutorials plugin so the highway WS can resolve them by path
+        # (see plugins/tutorials/routes.py::_seed_builtin_packs). They are
+        # lesson drills, not library songs, so keep them out of the scan —
+        # _resolve_dlc_path still loads them by path for playback.
+        def _is_tutorial(p: Path) -> bool:
+            return "tutorials-builtin" in p.parts
         # Skip RS1 compatibility mega-PSARCs (multi-song, not individually playable)
         psarcs = [f for f in sorted(dlc.rglob("*.psarc"))
                   if f.is_file()
-                  and "rs1compatibility" not in f.name.lower()]
+                  and "rs1compatibility" not in f.name.lower()
+                  and not _is_tutorial(f)]
         # Filter by platform suffix (_p.psarc = PC, _m.psarc = Mac) when the
         # user's DLC folder contains both variants of every song (e.g. a shared
         # Steam library between Windows and Mac).
@@ -1770,7 +1778,8 @@ def _background_scan():
             psarcs = [f for f in psarcs if not f.stem.endswith("_p")]
         # Sloppaks: match both file (zip) and directory form by suffix.
         sloppaks = [f for f in sorted(dlc.rglob("*.sloppak"))
-                    if sloppak_mod.is_sloppak(f)]
+                    if sloppak_mod.is_sloppak(f)
+                    and not _is_tutorial(f)]
 
         # Loose song folders: any directory containing a non-preview *.wem + *.xml.
         # Skip directories that are actually sloppak bundles — those are
@@ -1782,6 +1791,8 @@ def _background_scan():
         sloppak_dirs = {p for p in sloppaks if p.is_dir()}
         for wem in sorted(dlc.rglob("*.wem")):
             if "preview" in wem.stem.lower():
+                continue
+            if _is_tutorial(wem):
                 continue
             d = wem.parent
             if d in sloppak_dirs or d.name.lower().endswith(".sloppak"):
