@@ -8207,6 +8207,14 @@
                             Object.assign(_scrChordNote, cn);
                             _scrChordNote.t   = ch.t;
                             _scrChordNote.sus = cn.sus || 0;
+                            // `fhm` is omit-when-false in the wire format (unlike `mt`/`pm`
+                            // which are always emitted). Before 5913129, chord-level
+                            // fretHandMute was folded into `mt` (always-emitted), so
+                            // Object.assign would overwrite any stale value. After that
+                            // commit fhm is its own field — absent on non-muted notes —
+                            // so Object.assign leaves a stale `true` from a previous
+                            // muted chord note untouched. Reset it explicitly here.
+                            _scrChordNote.fhm = cn.fhm || false;
                             drawNote(
                                 _scrChordNote,
                                 now,
