@@ -1014,6 +1014,9 @@ def is_drum_track(track: guitarpro.Track) -> bool:
 
 def list_tracks(gp_path: str) -> list[dict]:
     """List all tracks in a Guitar Pro file with basic info."""
+    if Path(gp_path).suffix.lower() == '.gpx':
+        from gp2rs_gpx import list_tracks as _gpx_list_tracks
+        return _gpx_list_tracks(gp_path)
     song = guitarpro.parse(gp_path)
     tracks = []
     for i, track in enumerate(song.tracks):
@@ -1688,6 +1691,13 @@ def convert_file(
     Returns:
         List of output XML file paths
     """
+    if Path(gp_path).suffix.lower() == '.gpx':
+        from gp2rs_gpx import convert_file as _gpx_convert_file
+        return _gpx_convert_file(
+            gp_path, output_dir, track_indices, audio_offset,
+            arrangement_names, force_standard_tuning,
+            expand_repeats=expand_repeats,
+        )
     song = guitarpro.parse(gp_path)
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
