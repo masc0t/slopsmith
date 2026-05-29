@@ -1987,9 +1987,10 @@ async def startup_events():
         # expose despite this branch reporting zero loaded plugins. Normal
         # startup clears it inside load_plugins; do the same here under the
         # same lock so this skip path matches that invariant.
-        from plugins import LOADED_PLUGINS, PLUGINS_LOCK
+        from plugins import LOADED_PLUGINS, PENDING_PLUGINS, PLUGINS_LOCK
         with PLUGINS_LOCK:
             LOADED_PLUGINS.clear()
+            PENDING_PLUGINS.clear()
         _set_startup_status(
             running=False,
             phase="complete",

@@ -19,10 +19,24 @@ log = logging.getLogger("slopsmith.plugins")
 
 
 PLUGINS_DIR = Path(__file__).parent
+# Holds only *ready* (loaded) plugins — those whose dependencies installed
+# and whose routes registered. A plugin GRADUATES from PENDING_PLUGINS into
+# this list when it becomes ready. Kept ready-only because every consumer
+# that imports LOADED_PLUGINS (settings export/import, diagnostics, the
+# orphan-detection in lib/diagnostics_bundle.py) wants only usable plugins.
 LOADED_PLUGINS = []
-# Guards all mutations of and snapshots from LOADED_PLUGINS so the
-# background plugin-loader thread and the event-loop request handlers
-# never race on the list.
+# Every discovered plugin that is NOT yet ready, keyed by plugin_id and held
+# in discovery order. Each value is a lightweight, manifest-derived nav entry
+# (no routes, no callables) carrying a `status` of "installing" or "failed"
+# (plus `error` text when failed) so /api/plugins can render the nav slot
+# immediately — disabled "installing…" / "failed" — while the background
+# loader works through installs sequentially. A plugin leaves PENDING_PLUGINS
+# only by GRADUATING into LOADED_PLUGINS (ready); a failed plugin stays here
+# so it remains a visible, disabled nav entry until the next restart retries it.
+PENDING_PLUGINS: dict = {}
+# Guards all mutations of and snapshots from LOADED_PLUGINS and
+# PENDING_PLUGINS so the background plugin-loader thread and the event-loop
+# request handlers never race on either structure.
 PLUGINS_LOCK = threading.RLock()
 
 # Persistent pip install location (survives container restarts)
@@ -546,6 +560,46 @@ def load_plugins(app: FastAPI, context: dict, progress_cb=None, route_setup_fn=N
             # Progress reporting must never break plugin startup.
             pass
 
+    # Re-entrancy: a fresh load_plugins() pass owns the published state from
+    # scratch. Clearing BOTH structures at the START (rather than an atomic
+    # clear()+extend() at the END) lets us publish each plugin incrementally
+    # as it graduates, so /api/plugins reflects ready plugins the moment they
+    # are usable instead of all-at-once when the slowest install finishes.
+    # Tests and dev "reload plugins" re-invoke this; the clear keeps repeated
+    # passes from accumulating duplicates while preserving list identity.
+    with PLUGINS_LOCK:
+        LOADED_PLUGINS.clear()
+        PENDING_PLUGINS.clear()
+
+    def _loaded_count() -> int:
+        with PLUGINS_LOCK:
+            return len(LOADED_PLUGINS)
+
+    def _mark_failed(plugin_id: str, error: str) -> None:
+        """Flip a pending plugin's status to "failed" with error text so it
+        stays a visible, disabled nav entry. No-op if the plugin already
+        graduated (it can't fail after becoming ready)."""
+        with PLUGINS_LOCK:
+            entry = PENDING_PLUGINS.get(plugin_id)
+            if entry is not None:
+                entry["status"] = "failed"
+                entry["error"] = error
+
+    def _graduate(entry: dict) -> int:
+        """Move a plugin from pending to loaded (ready). Inserts into
+        LOADED_PLUGINS at the slot dictated by its discovery order (`_order`)
+        so the published list stays in discovery order even when earlier
+        plugins failed (leaving gaps) or a user-copy fallback graduates out of
+        sequence after the main loop. Pops the pending entry under the same
+        lock so a reader never sees the plugin in both structures. Returns the
+        new ready count."""
+        order = entry.get("_order", 0)
+        with PLUGINS_LOCK:
+            pos = sum(1 for e in LOADED_PLUGINS if e.get("_order", 0) < order)
+            LOADED_PLUGINS.insert(pos, entry)
+            PENDING_PLUGINS.pop(entry["id"], None)
+            return len(LOADED_PLUGINS)
+
     # Collect plugin directories — user plugins first so they override built-in
     plugin_dirs = []
     user_plugins_dir = os.environ.get("SLOPSMITH_PLUGINS_DIR")
@@ -735,10 +789,41 @@ def load_plugins(app: FastAPI, context: dict, progress_cb=None, route_setup_fn=N
         total=len(plugin_load_specs),
     )
 
-    # Accumulate into a local list and publish atomically once all
-    # plugins are loaded, so concurrent readers never see a partially
-    # populated LOADED_PLUGINS.
-    _loaded_batch: list = []
+    def _nav_entry(plugin_id: str, plugin_dir: Path, manifest: dict, order: int) -> dict:
+        """Build the manifest-derived nav fields shared by a pending entry and
+        a graduated (ready) entry. Carries everything /api/plugins needs to
+        render the nav slot — name, nav, type, bundled flag, version, and the
+        has_* capability booleans — without importing the plugin's code."""
+        return {
+            "id": plugin_id,
+            "name": manifest.get("name", plugin_id),
+            "nav": manifest.get("nav"),
+            "type": manifest.get("type"),
+            "bundled": _is_bundled(plugin_dir, manifest),
+            "version": manifest.get("version"),
+            "has_screen": bool(manifest.get("screen")),
+            "has_script": bool(manifest.get("script")),
+            "has_settings": bool(manifest.get("settings")),
+            "has_tour": _is_valid_tour_manifest(manifest.get("tour")),
+            "_order": order,
+        }
+
+    # Record EVERY discovered plugin as a pending "installing" nav entry up
+    # front, in discovery order, so /api/plugins can render the full nav
+    # immediately — before any (potentially 20-30 min) dependency install
+    # runs. A plugin graduates out of here into LOADED_PLUGINS when ready;
+    # on failure it stays here flipped to "failed". `_spec_order` maps each
+    # kept plugin_id to its discovery index so a user-copy fallback graduating
+    # after the main loop can reclaim the bundled plugin's original nav slot.
+    _spec_order: dict[str, int] = {}
+    with PLUGINS_LOCK:
+        for idx, (plugin_id, plugin_dir, manifest) in enumerate(plugin_load_specs):
+            _spec_order[plugin_id] = idx
+            entry = _nav_entry(plugin_id, plugin_dir, manifest, idx)
+            entry["status"] = "installing"
+            entry["error"] = None
+            PENDING_PLUGINS[plugin_id] = entry
+
     # Track plugin_ids whose routes.setup() raised an exception, so we
     # can fall back to evicted user copies for those plugin_ids below.
     _route_failed_ids: set[str] = set()
@@ -768,11 +853,18 @@ def load_plugins(app: FastAPI, context: dict, progress_cb=None, route_setup_fn=N
         )
         req_ok = _install_requirements(plugin_dir, plugin_id)
         if not req_ok:
+            # Non-fatal: a pip failure may just mean an OPTIONAL dependency
+            # couldn't be installed (read-only filesystem, an extra a plugin
+            # degrades gracefully without). We surface the error but still try
+            # to load routes. If the plugin genuinely needs the missing dep its
+            # routes will fail to import below and it becomes "failed" there —
+            # so a real install failure still surfaces as a visible, disabled
+            # nav entry (ADR 0001) without disabling plugins that work anyway.
             _emit_progress(
                 "plugin-error",
                 f"Failed to install requirements for '{plugin_id}'",
                 plugin_id=plugin_id,
-                loaded=idx,
+                loaded=_loaded_count(),
                 total=len(plugin_load_specs),
                 error="Requirements installation failed; check server logs for details",
             )
@@ -805,7 +897,12 @@ def load_plugins(app: FastAPI, context: dict, progress_cb=None, route_setup_fn=N
         )
         plugin_context["log"] = logging.getLogger(f"slopsmith.plugin.{plugin_id}")
 
-        # Load routes using importlib to avoid module name collisions
+        # Load routes using importlib to avoid module name collisions.
+        # `route_ok` gates graduation: only a plugin that installs AND
+        # registers its routes cleanly becomes ready. A route failure leaves
+        # it "failed" in PENDING_PLUGINS (the fallback block below may still
+        # graduate a user-copy for an evicted bundled plugin).
+        route_ok = True
         routes_file = manifest.get("routes")
         if routes_file:
             _emit_progress(
@@ -848,6 +945,7 @@ def load_plugins(app: FastAPI, context: dict, progress_cb=None, route_setup_fn=N
                     log.info("Loaded routes for plugin %r", plugin_id)
             except Exception as e:
                 log.exception("Failed to load routes for plugin %r", plugin_id)
+                route_ok = False
                 _route_failed_ids.add(plugin_id)
                 # If this was a mid-flight timeout, mark the plugin so the
                 # fallback block skips it — the original setup() may still be
@@ -897,36 +995,29 @@ def load_plugins(app: FastAPI, context: dict, progress_cb=None, route_setup_fn=N
                     # Purge immediately to prevent module leakage into later plugins.
                     for _k in _stale:
                         sys.modules.pop(_k, None)
+                _mark_failed(plugin_id, str(e))
                 _emit_progress(
                     "plugin-error",
                     f"Failed loading routes for '{plugin_id}'",
                     plugin_id=plugin_id,
-                    loaded=idx,
+                    loaded=_loaded_count(),
                     total=len(plugin_load_specs),
                     error=str(e),
                 )
 
-        _loaded_batch.append({
-            "id": plugin_id,
-            "name": manifest.get("name", plugin_id),
-            "nav": manifest.get("nav"),
-            # `type` is an optional manifest hint for the frontend —
-            # e.g. "visualization" lets the highway viz picker know
-            # this plugin offers a renderer. Absent → no declared
-            # role; plugin is still loaded and scripts run, it just
-            # doesn't show up in role-specific UIs. See slopsmith#36.
-            "type": manifest.get("type"),
-            # Uses the same _is_bundled() helper as the duplicate-skip path.
-            # See the helper's docstring for the three-part check that prevents
-            # user-installed plugins (cloned into plugins/ or carrying a forged
-            # "bundled": true manifest field) from being misidentified as core.
-            # Surfaced in /api/plugins so the plugin-list UI can render a
-            # 'Bundled' badge next to the plugin name in the settings collapsible.
-            "bundled": _is_bundled(plugin_dir, manifest),
-            "has_screen": bool(manifest.get("screen")),
-            "has_script": bool(manifest.get("script")),
-            "has_settings": bool(manifest.get("settings")),
-            "has_tour": _is_valid_tour_manifest(manifest.get("tour")),
+        if not route_ok:
+            # Not ready: leave it "failed" in PENDING_PLUGINS so it shows as a
+            # disabled nav entry. If it's a bundled plugin that evicted a user
+            # copy, the fallback block below may still graduate that copy.
+            continue
+
+        # Graduate: dependencies are installed and routes registered, so the
+        # plugin is ready. Publish it incrementally — readers (and the SSE
+        # `plugin-registered` event that drives the frontend re-fetch) see it
+        # the moment it's usable, not when the slowest sibling finishes.
+        loaded_entry = dict(_nav_entry(plugin_id, plugin_dir, manifest, idx))
+        loaded_entry.update({
+            "status": "ready",
             # Normalized list of relpaths under CONFIG_DIR that this
             # plugin opts in to settings export/import. Empty for
             # plugins that don't declare `settings.server_files`. See
@@ -940,12 +1031,13 @@ def load_plugins(app: FastAPI, context: dict, progress_cb=None, route_setup_fn=N
             "_dir": plugin_dir,
             "_manifest": manifest,
         })
+        _new_count = _graduate(loaded_entry)
         log.info("Registered plugin %r (%s)", plugin_id, manifest.get("name", ""))
         _emit_progress(
             "plugin-registered",
             f"Registered plugin '{plugin_id}'",
             plugin_id=plugin_id,
-            loaded=idx + 1,
+            loaded=_new_count,
             total=len(plugin_load_specs),
         )
 
@@ -982,9 +1074,9 @@ def load_plugins(app: FastAPI, context: dict, progress_cb=None, route_setup_fn=N
                 "Restart the server to recover.",
                 evicted_id,
             )
-            # Remove the broken bundled entry too — its routes are in an
-            # unknown state and it should not appear in /api/plugins.
-            _loaded_batch[:] = [e for e in _loaded_batch if e["id"] != evicted_id]
+            # The broken bundled plugin never graduated (route_ok was False),
+            # so there is nothing to remove from LOADED_PLUGINS; it stays a
+            # "failed" pending entry until a restart recovers it.
             continue
         _ev_id, ev_dir, ev_manifest = evicted_spec
         log.warning(
@@ -992,15 +1084,11 @@ def load_plugins(app: FastAPI, context: dict, progress_cb=None, route_setup_fn=N
             "falling back to user-installed copy at %s.",
             evicted_id, ev_dir,
         )
-        # Remove the broken bundled entry from the batch, recording its
-        # original position so the fallback is inserted there instead of
-        # being appended at the end (appending would change the order of
-        # plugins in /api/plugins and the frontend playSong wrapper chain).
-        _bundled_orig_idx = next(
-            (i for i, e in enumerate(_loaded_batch) if e["id"] == evicted_id),
-            len(_loaded_batch),
-        )
-        _loaded_batch[:] = [e for e in _loaded_batch if e["id"] != evicted_id]
+        # The fallback reclaims the bundled plugin's original discovery slot so
+        # /api/plugins order (and the frontend playSong wrapper chain) is
+        # preserved. The broken bundled copy never graduated, so we just
+        # graduate the user copy at the bundled plugin's `_order`.
+        _bundled_orig_order = _spec_order.get(evicted_id, len(plugin_load_specs))
         # Ensure the fallback directory is at the FRONT of sys.path so
         # its modules take priority over any bundled copy still present.
         # Simply inserting when absent is not enough: on repeated
@@ -1034,7 +1122,7 @@ def load_plugins(app: FastAPI, context: dict, progress_cb=None, route_setup_fn=N
                 "plugin-error",
                 f"Failed to install requirements for fallback copy of '{evicted_id}'",
                 plugin_id=evicted_id,
-                loaded=len(_loaded_batch),
+                loaded=_loaded_count(),
                 total=len(plugin_load_specs),
                 error="Requirements installation failed for fallback copy; check server logs",
             )
@@ -1100,21 +1188,23 @@ def load_plugins(app: FastAPI, context: dict, progress_cb=None, route_setup_fn=N
                     "Fallback user-installed copy of %r also failed to load routes; "
                     "plugin unavailable (not registered).", evicted_id,
                 )
-                # Emit a plugin-error so startup-status reflects the
-                # fallback's failure as the root cause, not the earlier
-                # bundled-copy error. Without this the status stays on the
-                # stale bundled error even though that's no longer the
-                # active failure.
+                # Update the failed pending entry + emit a plugin-error so both
+                # /api/plugins and startup-status reflect the fallback's failure
+                # as the root cause, not the earlier bundled-copy error. Without
+                # this the status stays on the stale bundled error even though
+                # that's no longer the active failure.
+                _both_failed_err = (
+                    f"Both bundled and user-installed copies of '{evicted_id}' "
+                    "failed to load routes; plugin unavailable — check server logs"
+                )
+                _mark_failed(evicted_id, _both_failed_err)
                 _emit_progress(
                     "plugin-error",
                     f"Fallback copy of plugin '{evicted_id}' also failed to load routes",
                     plugin_id=evicted_id,
-                    loaded=len(_loaded_batch),
+                    loaded=_loaded_count(),
                     total=len(plugin_load_specs),
-                    error=(
-                        f"Both bundled and user-installed copies of '{evicted_id}' "
-                        "failed to load routes; plugin unavailable — check server logs"
-                    ),
+                    error=_both_failed_err,
                 )
                 # Warn on partial registration in the fallback path too.
                 _fallback_routes_after = len(getattr(app, "routes", []))
@@ -1126,21 +1216,14 @@ def load_plugins(app: FastAPI, context: dict, progress_cb=None, route_setup_fn=N
                     )
                 fallback_routes_ok = False
         if fallback_routes_ok:
-            _loaded_batch.insert(_bundled_orig_idx, {
-                "id": evicted_id,
-                "name": ev_manifest.get("name", evicted_id),
-                "nav": ev_manifest.get("nav"),
-                "type": ev_manifest.get("type"),
-                "bundled": False,  # user copy, not bundled
-                # Marks this entry as an emergency user-copy fallback: the
-                # bundled routes failed, so the evicted user-installed copy
-                # was loaded instead.  Surfaced in /api/plugins and the
-                # settings UI so users know the bundled build is broken.
+            ev_entry = dict(_nav_entry(evicted_id, ev_dir, ev_manifest, _bundled_orig_order))
+            ev_entry.update({
+                "status": "ready",
+                # _nav_entry already sets bundled=False for a user copy
+                # (not in PLUGINS_DIR); mark it as the emergency fallback so
+                # /api/plugins and the settings UI can warn that the bundled
+                # build is broken and an older user copy is running.
                 "fallback": True,
-                "has_screen": bool(ev_manifest.get("screen")),
-                "has_script": bool(ev_manifest.get("script")),
-                "has_settings": bool(ev_manifest.get("settings")),
-                "has_tour": _is_valid_tour_manifest(ev_manifest.get("tour")),
                 "_export_paths": _normalize_export_paths(ev_manifest.get("settings"), evicted_id),
                 "_diagnostics_paths": _normalize_diagnostics_paths(ev_manifest.get("diagnostics"), evicted_id),
                 "_diagnostics_callable_spec": _parse_diagnostics_callable(ev_manifest.get("diagnostics"), evicted_id),
@@ -1148,6 +1231,7 @@ def load_plugins(app: FastAPI, context: dict, progress_cb=None, route_setup_fn=N
                 "_dir": ev_dir,
                 "_manifest": ev_manifest,
             })
+            _graduate(ev_entry)
             log.info("Registered fallback user copy of plugin %r (%s)", evicted_id, ev_manifest.get("name", ""))
             # Emit a compensating progress event to clear the bundled-failure
             # error from startup-status. Without this, the final
@@ -1162,24 +1246,18 @@ def load_plugins(app: FastAPI, context: dict, progress_cb=None, route_setup_fn=N
                 "plugin-registered",
                 f"Registered fallback copy of plugin '{evicted_id}'",
                 plugin_id=evicted_id,
-                loaded=len(_loaded_batch),
+                loaded=_loaded_count(),
                 total=len(plugin_load_specs),
                 clear_error=ev_req_ok,
             )
 
-    # Publish all plugins atomically so concurrent readers never observe
-    # a partially-populated list during the loading window.  We clear
-    # first so that repeated load_plugins() calls (tests, dev reloads,
-    # future "reload plugins" feature) never accumulate duplicate entries
-    # while keeping the list object identity stable.
-    with PLUGINS_LOCK:
-        LOADED_PLUGINS.clear()
-        LOADED_PLUGINS.extend(_loaded_batch)
-
+    # No final atomic publish: plugins were published incrementally as they
+    # graduated (see _graduate). LOADED_PLUGINS now holds exactly the ready
+    # plugins; any that failed remain visible as "failed" pending entries.
     _emit_progress(
         "plugins-complete",
-        f"Loaded {len(_loaded_batch)} plugin(s)",
-        loaded=len(_loaded_batch),
+        f"Loaded {_loaded_count()} plugin(s)",
+        loaded=_loaded_count(),
         total=len(plugin_load_specs),
     )
 
@@ -1222,10 +1300,19 @@ def register_plugin_api(app: FastAPI):
 
     @app.get("/api/plugins")
     def list_plugins():
+        # Return the UNION of ready (LOADED_PLUGINS) and not-yet-ready
+        # (PENDING_PLUGINS) plugins, each carrying a `status` so the nav can
+        # render every discovered plugin immediately — ready ones active,
+        # installing/failed ones disabled — instead of waiting for the
+        # slowest dependency install (issue #421). Rows are re-sorted by their
+        # discovery order so the nav slot of a still-installing plugin sits
+        # where it will land once ready, regardless of which structure it's in.
         with PLUGINS_LOCK:
-            snapshot = list(LOADED_PLUGINS)
-        return [
-            {
+            loaded = list(LOADED_PLUGINS)
+            pending = list(PENDING_PLUGINS.values())
+        rows: list[tuple] = []
+        for p in loaded:
+            rows.append((p.get("_order", 0), {
                 "id": p["id"],
                 "name": p["name"],
                 # Surface the manifest's `version` field (free-form
@@ -1255,9 +1342,35 @@ def register_plugin_api(app: FastAPI):
                 "has_script": p["has_script"],
                 "has_settings": p["has_settings"],
                 "has_tour": p.get("has_tour", False),
-            }
-            for p in snapshot
-        ]
+                # Anything in LOADED_PLUGINS is ready by construction.
+                "status": "ready",
+                "error": None,
+            }))
+        for e in pending:
+            rows.append((e.get("_order", 0), {
+                "id": e["id"],
+                "name": e["name"],
+                "version": e.get("version"),
+                "nav": e.get("nav"),
+                "type": e.get("type"),
+                "bundled": e.get("bundled", False),
+                # A pending plugin is never an active fallback (the fallback
+                # only exists once a user copy has graduated to ready).
+                "fallback": False,
+                "has_screen": e.get("has_screen", False),
+                "has_script": e.get("has_script", False),
+                "has_settings": e.get("has_settings", False),
+                "has_tour": e.get("has_tour", False),
+                # "installing" while its deps install; "failed" if the install
+                # or route load failed (the nav entry stays, disabled, with
+                # the error text in `error`).
+                "status": e.get("status", "installing"),
+                "error": e.get("error"),
+            }))
+        # Stable sort by discovery order. Stubbed test entries default to 0 and
+        # keep their insertion order (loaded before pending) under a stable sort.
+        rows.sort(key=lambda r: r[0])
+        return [row for _, row in rows]
 
     @app.get("/api/plugins/updates")
     def check_updates():
@@ -1283,6 +1396,8 @@ def register_plugin_api(app: FastAPI):
             snapshot = list(LOADED_PLUGINS)
         for p in snapshot:
             if p["id"] == plugin_id:
+                if p.get("status", "ready") != "ready":
+                    break
                 git_dir = p["_dir"] / ".git"
                 if not git_dir.exists():
                     return {"error": "Not a git repository"}
@@ -1315,6 +1430,8 @@ def register_plugin_api(app: FastAPI):
             snapshot = list(LOADED_PLUGINS)
         for p in snapshot:
             if p["id"] == plugin_id:
+                if p.get("status", "ready") != "ready":
+                    break
                 screen_file = p["_dir"] / p["_manifest"].get("screen", "screen.html")
                 if screen_file.exists():
                     return HTMLResponse(screen_file.read_text(encoding="utf-8"))
@@ -1326,6 +1443,8 @@ def register_plugin_api(app: FastAPI):
             snapshot = list(LOADED_PLUGINS)
         for p in snapshot:
             if p["id"] == plugin_id:
+                if p.get("status", "ready") != "ready":
+                    break
                 script_file = p["_dir"] / p["_manifest"].get("script", "screen.js")
                 if script_file.exists():
                     return Response(script_file.read_text(encoding="utf-8"), media_type="application/javascript")
@@ -1337,6 +1456,8 @@ def register_plugin_api(app: FastAPI):
             snapshot = list(LOADED_PLUGINS)
         for p in snapshot:
             if p["id"] == plugin_id:
+                if p.get("status", "ready") != "ready":
+                    break
                 settings = p["_manifest"].get("settings", {})
                 settings_file = p["_dir"] / (settings.get("html", "settings.html") if isinstance(settings, dict) else "settings.html")
                 if settings_file.exists():
@@ -1349,6 +1470,8 @@ def register_plugin_api(app: FastAPI):
             snapshot = list(LOADED_PLUGINS)
         for p in snapshot:
             if p["id"] == plugin_id:
+                if p.get("status", "ready") != "ready":
+                    break
                 tour_val = p["_manifest"].get("tour")
                 if not _is_valid_tour_manifest(tour_val):
                     break
@@ -1400,6 +1523,8 @@ def register_plugin_api(app: FastAPI):
             snapshot = list(LOADED_PLUGINS)
         for p in snapshot:
             if p["id"] == plugin_id:
+                if p.get("status", "ready") != "ready":
+                    break
                 target = safe_join(p["_dir"] / "assets", asset_path)
                 if target is None:
                     log.warning("Plugin %r: asset path rejected: %r", plugin_id, asset_path)

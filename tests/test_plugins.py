@@ -72,10 +72,12 @@ def reset_plugin_state(monkeypatch):
     monkeypatch.delenv("SLOPSMITH_PLUGINS_DIR", raising=False)
     plugins = importlib.import_module("plugins")
     saved_loaded = list(plugins.LOADED_PLUGINS)
+    saved_pending = dict(plugins.PENDING_PLUGINS)
     saved_modules = {k: v for k, v in sys.modules.items() if k.startswith("plugin_")}
     saved_bare = {k: sys.modules[k] for k in _BARE_NAMES_USED if k in sys.modules}
     saved_path = list(sys.path)
     plugins.LOADED_PLUGINS.clear()
+    plugins.PENDING_PLUGINS.clear()
     for k in list(sys.modules):
         if k.startswith("plugin_") or k in _BARE_NAMES_USED:
             del sys.modules[k]
@@ -84,6 +86,8 @@ def reset_plugin_state(monkeypatch):
     finally:
         plugins.LOADED_PLUGINS.clear()
         plugins.LOADED_PLUGINS.extend(saved_loaded)
+        plugins.PENDING_PLUGINS.clear()
+        plugins.PENDING_PLUGINS.update(saved_pending)
         for k in list(sys.modules):
             if k.startswith("plugin_") or k in _BARE_NAMES_USED:
                 del sys.modules[k]
@@ -2440,6 +2444,167 @@ def test_progress_cb_emits_plugin_error_on_requirements_failure(tmp_path, reset_
     assert all(e["error"] for e in error_events), "plugin-error events must carry a non-empty error field"
     # Loading continued: req_fail is still registered.
     assert any(p["id"] == "req_fail" for p in plugins.LOADED_PLUGINS)
+
+
+# ── Async loading: pending registry, incremental publish, failed status ─────────
+
+def test_pending_then_incremental_publish_observed_during_setup(tmp_path, reset_plugin_state):
+    """Every discovered plugin is recorded in PENDING_PLUGINS as "installing"
+    up front, then GRADUATES into LOADED_PLUGINS as it becomes ready — one at a
+    time, not all-at-once at the end (issue #421 incremental publish).
+
+    Each plugin's setup() records the live LOADED/PENDING state under its own
+    plugin id (read from ctx['log'].name):
+      * During "aaa".setup(): both plugins are still pending+installing and
+        nothing has graduated yet (LOADED is empty).
+      * During "zzz".setup(): "aaa" has ALREADY graduated into LOADED while
+        "zzz" is still pending — proving plugins publish incrementally.
+    """
+    plugins = reset_plugin_state
+    body = (
+        "import plugins\n"
+        "def setup(app, ctx):\n"
+        "    pid = ctx['log'].name.rsplit('.', 1)[-1]\n"
+        "    app.state.snaps = getattr(app.state, 'snaps', {})\n"
+        "    app.state.snaps[pid] = {\n"
+        "        'pending': {k: v['status'] for k, v in plugins.PENDING_PLUGINS.items()},\n"
+        "        'loaded': [p['id'] for p in plugins.LOADED_PLUGINS],\n"
+        "    }\n"
+    )
+    _make_plugin(tmp_path, "aaa", routes_body=body)
+    _make_plugin(tmp_path, "zzz", routes_body=body)
+
+    fake_app = type("FakeApp", (), {})()
+    fake_app.state = type("State", (), {})()
+    _run_load_plugins(plugins, fake_app, tmp_path)
+
+    snaps = fake_app.state.snaps
+    # During aaa.setup(): both pending+installing, nothing graduated yet.
+    assert snaps["aaa"]["pending"] == {"aaa": "installing", "zzz": "installing"}
+    assert snaps["aaa"]["loaded"] == []
+    # During zzz.setup(): aaa already graduated (incremental publish); zzz pending.
+    assert snaps["zzz"]["loaded"] == ["aaa"]
+    assert "zzz" in snaps["zzz"]["pending"]
+    assert "aaa" not in snaps["zzz"]["pending"]
+    # Final: both ready, none pending.
+    assert sorted(p["id"] for p in plugins.LOADED_PLUGINS) == ["aaa", "zzz"]
+    assert plugins.PENDING_PLUGINS == {}
+
+
+def test_failed_plugin_shows_failed_status_and_stays_visible(tmp_path, reset_plugin_state):
+    """A plugin whose routes fail to load is NOT added to LOADED_PLUGINS
+    (ready-only) but STAYS visible as a disabled "failed" entry in
+    PENDING_PLUGINS and on /api/plugins, with its error text — so the nav can
+    render it disabled with a tooltip rather than dropping it (ADR 0001)."""
+    plugins = reset_plugin_state
+    _make_plugin(tmp_path, "okp")  # healthy, no-op setup
+    _make_plugin(
+        tmp_path, "broken",
+        routes_body="def setup(app, ctx):\n    raise RuntimeError('boom')\n",
+    )
+    _run_load_plugins(plugins, type("FakeApp", (), {})(), tmp_path)
+
+    # LOADED_PLUGINS stays ready-only: broken absent, okp present.
+    loaded_ids = {p["id"] for p in plugins.LOADED_PLUGINS}
+    assert "broken" not in loaded_ids
+    assert "okp" in loaded_ids
+    # broken remains a visible "failed" pending entry with error text.
+    assert plugins.PENDING_PLUGINS["broken"]["status"] == "failed"
+    assert plugins.PENDING_PLUGINS["broken"]["error"]
+    assert "okp" not in plugins.PENDING_PLUGINS  # graduated, no longer pending
+
+    # /api/plugins exposes the union with per-plugin status + error.
+    client = _make_api_client(plugins)
+    try:
+        rows = {p["id"]: p for p in client.get("/api/plugins").json()}
+        assert rows["broken"]["status"] == "failed"
+        assert rows["broken"]["error"]
+        assert rows["okp"]["status"] == "ready"
+        assert rows["okp"]["error"] is None
+    finally:
+        client.close()
+
+
+def test_api_plugins_surfaces_installing_pending_entry(tmp_path, reset_plugin_state):
+    """An "installing" pending entry surfaces on /api/plugins immediately with
+    its manifest-derived nav fields and status="installing" (no error), so the
+    frontend can render a disabled "installing…" nav slot before the (possibly
+    very slow) dependency install finishes."""
+    plugins = reset_plugin_state
+    pdir = tmp_path / "heavy"
+    pdir.mkdir()
+    plugins.PENDING_PLUGINS["heavy"] = {
+        "id": "heavy", "name": "Heavy ML Plugin", "nav": "/heavy",
+        "type": "visualization", "bundled": True, "version": "2.0.0",
+        "has_screen": True, "has_script": False, "has_settings": False,
+        "has_tour": False, "_order": 0, "status": "installing", "error": None,
+    }
+    client = _make_api_client(plugins)
+    try:
+        rows = {p["id"]: p for p in client.get("/api/plugins").json()}
+        h = rows["heavy"]
+        assert h["status"] == "installing"
+        assert h["error"] is None
+        assert h["nav"] == "/heavy"
+        assert h["type"] == "visualization"
+        assert h["bundled"] is True
+        assert h["version"] == "2.0.0"
+        assert h["has_screen"] is True
+        assert h["fallback"] is False
+    finally:
+        client.close()
+
+
+def test_api_plugins_union_sorted_by_discovery_order(tmp_path, reset_plugin_state):
+    """The /api/plugins union is re-sorted by discovery order so an installing
+    plugin occupies its eventual nav slot regardless of whether it currently
+    lives in LOADED_PLUGINS (ready) or PENDING_PLUGINS (installing/failed)."""
+    plugins = reset_plugin_state
+    pdir = tmp_path / "d"
+    pdir.mkdir()
+    # Ready plugin discovered SECOND (order 1) lives in LOADED_PLUGINS.
+    plugins.LOADED_PLUGINS.append({
+        "id": "ready_second", "name": "Ready", "nav": None, "type": None,
+        "bundled": False, "has_screen": False, "has_script": False,
+        "has_settings": False, "has_tour": False, "status": "ready",
+        "_order": 1, "_dir": pdir, "_manifest": {},
+    })
+    # Installing plugin discovered FIRST (order 0) lives in PENDING_PLUGINS.
+    plugins.PENDING_PLUGINS["installing_first"] = {
+        "id": "installing_first", "name": "Installing", "nav": None, "type": None,
+        "bundled": False, "version": None, "has_screen": False, "has_script": False,
+        "has_settings": False, "has_tour": False, "_order": 0,
+        "status": "installing", "error": None,
+    }
+    client = _make_api_client(plugins)
+    try:
+        order = [p["id"] for p in client.get("/api/plugins").json()]
+        assert order == ["installing_first", "ready_second"]
+    finally:
+        client.close()
+
+
+def test_pending_plugin_assets_not_served(tmp_path, reset_plugin_state):
+    """Asset endpoints serve only ready plugins. A plugin still installing
+    (present in PENDING_PLUGINS, absent from LOADED_PLUGINS) returns 404 for
+    its screen.js / screen.html even though its manifest advertises them."""
+    plugins = reset_plugin_state
+    pdir = tmp_path / "heavy"
+    pdir.mkdir()
+    (pdir / "screen.js").write_text("console.log('x');\n")
+    (pdir / "screen.html").write_text("<p>hi</p>\n")
+    plugins.PENDING_PLUGINS["heavy"] = {
+        "id": "heavy", "name": "Heavy", "nav": None, "type": None,
+        "bundled": False, "version": None, "has_screen": True, "has_script": True,
+        "has_settings": False, "has_tour": False, "_order": 0,
+        "status": "installing", "error": None, "_dir": pdir, "_manifest": {},
+    }
+    client = _make_api_client(plugins)
+    try:
+        assert client.get("/api/plugins/heavy/screen.js").status_code == 404
+        assert client.get("/api/plugins/heavy/screen.html").status_code == 404
+    finally:
+        client.close()
 
 
 # ── Tour API tests ─────────────────────────────────────────────────────────────

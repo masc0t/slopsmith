@@ -6719,124 +6719,6 @@ async function checkScanAndLoad() {
 }
 
 // ── Plugin loader ───────────────────────────────────────────────────────
-function setPluginLoadingState(loading, message) {
-    console.log('[slopsmith] setPluginLoadingState', loading, message, new Error().stack.split('\n')[2]);
-    const navContainer = document.getElementById('nav-plugins');
-    const mobileNavContainer = document.getElementById('mobile-nav-plugins');
-    const settingsArea = document.getElementById('plugin-settings-area');
-    if (!navContainer || !mobileNavContainer) return;
-
-    if (loading) {
-        navContainer.innerHTML = `<span class="text-xs text-gray-500 animate-pulse">${esc(message || 'Loading plugins...')}</span>`;
-        mobileNavContainer.innerHTML = `
-            <span class="text-xs text-gray-600 uppercase tracking-wider">Plugins</span>
-            <span class="text-xs text-gray-500 animate-pulse">${esc(message || 'Loading plugins...')}</span>`;
-        if (settingsArea) settingsArea.classList.add('hidden');
-        return;
-    }
-
-    navContainer.innerHTML = '';
-    mobileNavContainer.innerHTML = '<span class="text-xs text-gray-600 uppercase tracking-wider">Plugins</span>';
-}
-
-function _makeTimeoutStatus() {
-    return { running: false, phase: 'timeout', message: 'Plugin startup timed out', error: null, current_plugin: '', loaded: 0, total: 0 };
-}
-
-async function _waitViaSSE(timeoutMs) {
-    if (typeof EventSource === 'undefined') return null;
-    // Must exceed the server's _SSE_KA_INTERVAL (15 s) — keepalives are data
-    // events so onmessage re-arms this timer.  A gap > MSG_DEADLINE_MS means
-    // the proxy is buffering or dropping; fall back to polling.  Update this
-    // if _SSE_KA_INTERVAL in server.py changes.
-    const MSG_DEADLINE_MS = 20000;
-    return new Promise((resolve) => {
-        let resolved = false;
-        let msgDeadlineTimer = null;
-        const armDeadline = () => {
-            clearTimeout(msgDeadlineTimer);
-            msgDeadlineTimer = setTimeout(() => done(null), MSG_DEADLINE_MS);
-        };
-        const done = (result) => {
-            if (resolved) return;
-            resolved = true;
-            clearTimeout(timer);
-            clearTimeout(msgDeadlineTimer);
-            es.close();
-            resolve(result);
-        };
-        const timer = setTimeout(() => {
-            done(_makeTimeoutStatus());
-        }, timeoutMs);
-        armDeadline(); // deadline for the first message
-        const es = new EventSource('/api/startup-status/stream');
-        // Startup is a one-shot connection; treat any error (including transient
-        // reconnects that EventSource would normally retry) as a signal to fall
-        // back to polling rather than waiting for the browser to retry.
-        es.onerror = () => done(null);
-        es.onmessage = (event) => {
-            armDeadline(); // re-arm on every message — server sends data-level keepalives
-            let status;
-            try { status = JSON.parse(event.data); } catch { return; }
-            if (!status || status.type === 'keepalive') return; // keepalive — deadline re-armed, nothing else to do
-            if (!status.phase) return;
-            const phase = (status.phase || '').trim();
-            const msg = (status.message || '').trim() || 'Loading plugins...';
-            const countMsg = status.total > 0 ? ` (${status.loaded || 0}/${status.total})` : '';
-            setPluginLoadingState(Boolean(status.running), `${msg}${countMsg}`);
-            if (!status.running && (phase === 'complete' || phase === 'error')) done(status);
-        };
-    });
-}
-
-async function _waitViaPolling(timeoutMs) {
-    const start = Date.now();
-    let last = null;
-    let failCount = 0;
-    const MAX_CONSECUTIVE_FAILURES = 5;
-    while (Date.now() - start < timeoutMs) {
-        try {
-            const resp = await fetch('/api/startup-status');
-            if (resp.ok) {
-                failCount = 0;
-                const status = await resp.json();
-                last = status;
-                const phase = (status.phase || '').trim();
-                const msg = (status.message || '').trim() || 'Loading plugins...';
-                const countMsg = status.total > 0 ? ` (${status.loaded || 0}/${status.total})` : '';
-                setPluginLoadingState(Boolean(status.running), `${msg}${countMsg}`);
-                if (!status.running && (phase === 'complete' || phase === 'error')) return status;
-            } else {
-                failCount++;
-                if (failCount >= MAX_CONSECUTIVE_FAILURES) {
-                    setPluginLoadingState(false);
-                    return last || { running: false, phase: 'error', message: 'Startup status unavailable', error: null, current_plugin: '', loaded: 0, total: 0 };
-                }
-            }
-        } catch (e) {
-            failCount++;
-            if (failCount >= MAX_CONSECUTIVE_FAILURES) {
-                setPluginLoadingState(false);
-                return last || { running: false, phase: 'error', message: 'Startup status unavailable', error: null, current_plugin: '', loaded: 0, total: 0 };
-            }
-        }
-        await new Promise((r) => setTimeout(r, 800));
-    }
-    setPluginLoadingState(false);
-    return _makeTimeoutStatus();
-}
-
-async function waitForPluginStartupComplete(timeoutMs = 180000) {
-    const start = Date.now();
-    const sseResult = await _waitViaSSE(timeoutMs);
-    if (sseResult !== null) return sseResult;
-    const remaining = Math.max(0, timeoutMs - (Date.now() - start));
-    if (remaining <= 0) {
-        return _makeTimeoutStatus();
-    }
-    return _waitViaPolling(remaining);
-}
-
 let _loadPluginsInFlight = false;
 
 async function loadPlugins() {
@@ -6862,7 +6744,7 @@ async function loadPlugins() {
         // so we must preserve that DOM — the script load guard below skips
         // re-evaluating screen.js, and a fresh empty DOM with no listeners
         // would leave the plugin half-hydrated on subsequent loadPlugins()
-        // calls (e.g. _scheduleStartupRehydration).
+        // calls (e.g. the streamed refetches in _streamPluginStartup).
         //
         // The DOM-existence check is the safety net for plugins that
         // disappeared and reappeared between calls (uninstall + reinstall,
@@ -6965,25 +6847,61 @@ async function loadPlugins() {
 
             for (const plugin of navPlugins) {
                 const screenId = `plugin-${plugin.id}`;
+                // A plugin is navigable only once it's ready. While its deps
+                // install (status "installing") or after a failed load
+                // (status "failed") we still render the nav slot — disabled,
+                // with an "installing…" suffix or the error as a tooltip — so
+                // the nav is stable and the user sees the plugin is coming
+                // (#421). Entries without a status (legacy / stub) are ready.
+                const status = plugin.status || 'ready';
+                const isReady = status === 'ready';
+
                 const item = document.createElement('a');
                 item.href = '#';
-                item.className = 'block px-4 py-2 text-sm text-gray-400 hover:text-white hover:bg-dark-700 transition';
-                item.textContent = plugin.nav.label;
-                item.onclick = (e) => { e.preventDefault(); ddMenu.classList.add('hidden'); showScreen(screenId); window.slopsmithDemoTrack?.('event/plugin-open/' + plugin.id); };
                 ddMenu.appendChild(item);
-
                 // Mobile nav — flat list
                 const ma = document.createElement('a');
                 ma.href = '#';
-                ma.className = 'text-gray-400 hover:text-white pl-4 text-sm';
-                ma.textContent = plugin.nav.label;
-                ma.onclick = (e) => { e.preventDefault(); showScreen(screenId); ma.closest('#mobile-menu').classList.add('hidden'); window.slopsmithDemoTrack?.('event/plugin-open/' + plugin.id); };
                 mobileNavContainer.appendChild(ma);
+
+                if (isReady) {
+                    item.className = 'block px-4 py-2 text-sm text-gray-400 hover:text-white hover:bg-dark-700 transition';
+                    item.textContent = plugin.nav.label;
+                    item.onclick = (e) => { e.preventDefault(); ddMenu.classList.add('hidden'); showScreen(screenId); window.slopsmithDemoTrack?.('event/plugin-open/' + plugin.id); };
+                    ma.className = 'text-gray-400 hover:text-white pl-4 text-sm';
+                    ma.textContent = plugin.nav.label;
+                    ma.onclick = (e) => { e.preventDefault(); showScreen(screenId); ma.closest('#mobile-menu').classList.add('hidden'); window.slopsmithDemoTrack?.('event/plugin-open/' + plugin.id); };
+                } else {
+                    const installing = status === 'installing';
+                    const suffix = installing ? ' (installing…)' : ' (failed)';
+                    const tip = installing
+                        ? 'This plugin is installing its dependencies and will become available shortly.'
+                        : (plugin.error || 'This plugin failed to load. Check the server startup log for details.');
+                    // Disabled appearance: dimmed, default cursor, no nav handler.
+                    const cls = 'block px-4 py-2 text-sm text-gray-600 cursor-default select-none'
+                        + (installing ? ' animate-pulse' : '');
+                    item.className = cls;
+                    item.setAttribute('aria-disabled', 'true');
+                    item.title = tip;
+                    item.textContent = plugin.nav.label + suffix;
+                    // Swallow clicks so a disabled entry never navigates.
+                    item.onclick = (e) => { e.preventDefault(); };
+                    ma.className = 'pl-4 text-sm text-gray-600 cursor-default select-none' + (installing ? ' animate-pulse' : '');
+                    ma.setAttribute('aria-disabled', 'true');
+                    ma.title = tip;
+                    ma.textContent = plugin.nav.label + suffix;
+                    ma.onclick = (e) => { e.preventDefault(); };
+                }
             }
         }
 
         for (const plugin of plugins) {
             try {
+            // Only ready plugins have their assets available (the backend
+            // guards screen.html/screen.js/settings.html on status=="ready").
+            // Installing/failed plugins contribute only the disabled nav slot
+            // built above — skip screen/settings/script injection for them.
+            if (plugin.status && plugin.status !== 'ready') continue;
             const screenId = `plugin-${plugin.id}`;
 
             // Inject screen container. Skip for already-hydrated plugins —
@@ -7169,48 +7087,86 @@ async function loadPlugins() {
     return plugins;
 }
 
-async function _scheduleStartupRehydration() {
-    // Continue polling until the backend startup completes (or a long deadline).
-    // Used when the initial waitForPluginStartupComplete() window expired before
-    // LOADED_PLUGINS was populated — re-hydrates plugins + viz picker once done.
-    const REHYDRATE_TIMEOUT_MS = 10 * 60 * 1000; // 10 min additional window
+// Re-run loadPlugins (and the viz picker, since a newly-ready plugin may
+// register a window.slopsmithViz_<id> factory) when plugin status changes.
+// Debounced so a burst of plugin-registered/plugin-error events during
+// startup collapses into a single refetch.
+let _pluginRefreshTimer = null;
+function _refreshPluginsSoon() {
+    clearTimeout(_pluginRefreshTimer);
+    _pluginRefreshTimer = setTimeout(async () => {
+        const plugins = await loadPlugins();
+        if (plugins) _populateVizPicker(plugins);
+    }, 250);
+}
+
+let _pluginStreamStarted = false;
+function _streamPluginStartup() {
+    // Watch the SAME /api/startup-status/stream the splash used to gate on.
+    // Instead of blocking, we let the nav render immediately (loadPlugins ran
+    // already) and refetch whenever a plugin graduates to ready or fails — so
+    // its nav slot flips from "installing…" to active/failed without a reload
+    // (#421). loadPlugins is idempotent (in-flight guard + version map), so
+    // extra refetches are cheap and safe.
+    if (_pluginStreamStarted) return;
+    _pluginStreamStarted = true;
+
+    if (typeof EventSource === 'undefined') { _pollPluginStartup(); return; }
+
+    const es = new EventSource('/api/startup-status/stream');
+    es.onmessage = (event) => {
+        let status;
+        try { status = JSON.parse(event.data); } catch { return; }
+        if (!status || status.type === 'keepalive') return;
+        const phase = (status.phase || '').trim();
+        if (phase === 'plugin-registered' || phase === 'plugin-error') {
+            _refreshPluginsSoon();
+        }
+        // Terminal: one last refetch to catch anything missed, then stop.
+        if (!status.running && (phase === 'complete' || phase === 'error')) {
+            _refreshPluginsSoon();
+            es.close();
+        }
+    };
+    es.onerror = () => {
+        // Stream dropped (proxy buffering, backend hiccup). Stop retrying the
+        // stream and fall back to a bounded poll so late installs still surface.
+        es.close();
+        _pollPluginStartup();
+    };
+}
+
+let _pollStartupStarted = false;
+async function _pollPluginStartup() {
+    // SSE-unavailable fallback: poll /api/startup-status until the backend
+    // finishes its plugin loader, refetching whenever the ready count changes
+    // or it goes terminal. Bounded so a backend that never finishes doesn't
+    // poll forever.
+    if (_pollStartupStarted) return;
+    _pollStartupStarted = true;
+    const DEADLINE_MS = 30 * 60 * 1000; // generous: heavy ML installs can be long
     const start = Date.now();
-    console.log('[slopsmith] _scheduleStartupRehydration: started');
-    while (Date.now() - start < REHYDRATE_TIMEOUT_MS) {
-        await new Promise((r) => setTimeout(r, 5000));
+    let lastLoaded = -1;
+    while (Date.now() - start < DEADLINE_MS) {
+        await new Promise((r) => setTimeout(r, 3000));
         try {
             const resp = await fetch('/api/startup-status');
             if (!resp.ok) continue;
             const status = await resp.json();
-            console.log('[slopsmith] _scheduleStartupRehydration: poll —', status.phase, 'running:', status.running);
-            if (!status.running) {
-                if (status.phase === 'complete') {
-                    console.log('[slopsmith] Background startup complete — re-hydrating plugins');
-                    const plugins = await loadPlugins();
-                    _populateVizPicker(plugins);
-                } else {
-                    console.warn('[slopsmith] Backend startup ended without completing — skipping re-hydration');
-                }
-                return;
-            }
+            const loaded = Number(status.loaded || 0);
+            if (loaded !== lastLoaded) { lastLoaded = loaded; _refreshPluginsSoon(); }
+            if (!status.running) { _refreshPluginsSoon(); return; }
         } catch (_e) { /* network error — keep trying */ }
     }
 }
 
 async function bootstrapPluginsAndUi() {
-    setPluginLoadingState(true, 'Loading plugins...');
-    const startup = await waitForPluginStartupComplete();
-    if (startup && (startup.phase === 'error' || startup.phase === 'timeout')) {
-        const msg = startup.error || startup.message || 'Plugin startup failed';
-        setPluginLoadingState(false, '');
-        console.warn('Plugin startup reported error:', msg);
-        // On timeout the backend may still be loading. Continue polling in the
-        // background so plugins are hydrated once startup eventually completes.
-        if (startup.phase === 'timeout') {
-            _scheduleStartupRehydration();
-        }
-    }
+    // #421: never gate the nav on full plugin startup. Render it immediately
+    // from /api/plugins (ready plugins active; installing/failed disabled),
+    // then stream plugin status so each entry resolves in place as its
+    // dependencies finish installing or its load fails.
     const plugins = await loadPlugins();
+    _streamPluginStartup();
     return plugins;
 }
 
