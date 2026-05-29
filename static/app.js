@@ -48,6 +48,23 @@ function _isTextInput(el) {
     return false;
 }
 
+function _isShortcutHelpKey(e) {
+    return e.key === '?' || (e.shiftKey && (e.code === 'Slash' || e.key === '/'));
+}
+
+function _isShortcutHelpSuppressedTarget(el) {
+    if (!el) return false;
+    const tag = el.tagName;
+    if (tag === 'INPUT') {
+        const t = (el.type || 'text').toLowerCase();
+        return ['text', 'search', 'email', 'url', 'tel', 'password', 'number'].includes(t);
+    }
+    if (tag === 'TEXTAREA') return true;
+    if (el.isContentEditable) return true;
+    if (el.closest && el.closest('#lib-filter-drawer, [role="dialog"], #edit-modal, .slopsmith-modal')) return true;
+    return false;
+}
+
 function _activeSearchInput() {
     // Pick the search field for whichever screen is currently active.
     // No match (e.g. on the player or settings screen) means `/` does
@@ -823,6 +840,22 @@ document.addEventListener('keydown', (e) => {
 
     if (_handleLibArrowNav(e)) return;
 
+    // `?` (Shift+/) opens the keyboard-shortcuts cheat sheet. Some
+    // Linux/Electron stacks report Shift+/ as key='/' with code='Slash',
+    // so check the help shape before treating plain '/' as search.
+    if (_isShortcutHelpKey(e)) {
+        if (_isShortcutHelpSuppressedTarget(e.target || document.activeElement)) return;
+        e.preventDefault();
+        // Stop other keydown listeners on document (notably the shortcut
+        // registry below) from also consuming this event — otherwise a
+        // Linux/Electron Shift+Slash reported as key='/' opens help here and
+        // then the registry's plain `/` library-search shortcut focuses
+        // #lib-filter behind the modal. (Copilot review on #602.)
+        e.stopImmediatePropagation();
+        _openShortcutsModal();
+        return;
+    }
+
     if (e.key === '/') {
         if (_isTextInput(document.activeElement)) return;
         // Also bail when focus is inside the filter drawer, a dialog, or
@@ -846,16 +879,6 @@ document.addEventListener('keydown', (e) => {
             // selection APIs in older browsers; the focus alone is
             // still useful, just no caret-end guarantee.
         }
-        return;
-    }
-
-    // `?` (Shift+/) opens the keyboard-shortcuts cheat sheet. Same
-    // bail rules as the other shortcuts so typing a literal `?` in
-    // any input or drawer still works.
-    if (e.key === '?') {
-        if (_isInsideInteractiveControl(document.activeElement)) return;
-        e.preventDefault();
-        _openShortcutsModal();
         return;
     }
 

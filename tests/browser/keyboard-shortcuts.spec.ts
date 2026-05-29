@@ -1,5 +1,54 @@
 import { test, expect } from '@playwright/test';
 
+async function openPlayerWithMockSong(page) {
+  await page.evaluate(() => {
+    const messages = [
+      { type: 'song_info', title: 'Mock Song', artist: 'Mock Artist', arrangement: 'Lead', arrangement_index: 0, duration: 90, tuning: [0, 0, 0, 0, 0, 0], stringCount: 6, arrangements: [{ index: 0, name: 'Lead', notes: 1 }] },
+      { type: 'ready' },
+    ];
+
+    class MockWebSocket {
+      static CONNECTING = 0;
+      static OPEN = 1;
+      static CLOSING = 2;
+      static CLOSED = 3;
+      readyState = MockWebSocket.CONNECTING;
+      onopen = null;
+      onmessage = null;
+      onerror = null;
+      onclose = null;
+      url;
+
+      constructor(url) {
+        this.url = url;
+        setTimeout(() => {
+          this.readyState = MockWebSocket.OPEN;
+          if (this.onopen) this.onopen(new Event('open'));
+          for (const message of messages) {
+            if (this.onmessage) this.onmessage({ data: JSON.stringify(message) });
+          }
+        }, 0);
+      }
+
+      send() {}
+      close() {
+        this.readyState = MockWebSocket.CLOSED;
+        if (this.onclose) this.onclose(new CloseEvent('close'));
+      }
+    }
+
+    // @ts-ignore
+    window.WebSocket = MockWebSocket;
+  });
+
+  await page.evaluate(async () => {
+    // @ts-ignore
+    await window.playSong('mock-song.sloppak');
+  });
+  await page.waitForSelector('#player.active', { timeout: 5000 });
+  await expect(page.locator('#hud-title')).toHaveText('Mock Song', { timeout: 5000 });
+}
+
 test.describe('Keyboard Shortcuts', () => {
   test.beforeEach(async ({ page }) => {
     await page.goto('/');
@@ -55,6 +104,7 @@ test.describe('Keyboard Shortcuts', () => {
     for (const r of required) {
       expect(shortcuts).toContainEqual(r);
     }
+    expect(shortcuts.filter(s => s.key === '?' && s.scope === 'global')).toHaveLength(1);
   });
 
   test('should have global ? shortcut for help', async ({ page }) => {
@@ -121,6 +171,88 @@ test.describe('Keyboard Shortcuts', () => {
     // On library screen
     await page.keyboard.press('?');
     await expect(page.locator('#shortcuts-modal')).toBeVisible();
+  });
+
+  test('should focus library search for unshifted / without opening shortcut help', async ({ page }) => {
+    await page.keyboard.press('/');
+
+    await expect(page.locator('#lib-filter')).toBeFocused();
+    await expect(page.locator('#shortcuts-modal')).toHaveCount(0);
+  });
+
+  test('should not open shortcut help for Shift+Slash while typing in search', async ({ page }) => {
+    await page.locator('#lib-filter').focus();
+
+    await page.evaluate(() => {
+      const input = document.getElementById('lib-filter');
+      input?.dispatchEvent(new KeyboardEvent('keydown', {
+        key: '/',
+        code: 'Slash',
+        shiftKey: true,
+        bubbles: true,
+        cancelable: true,
+      }));
+    });
+
+    await expect(page.locator('#lib-filter')).toBeFocused();
+    await expect(page.locator('#shortcuts-modal')).toHaveCount(0);
+  });
+
+  test('Linux Shift+Slash on the library opens help without focusing search behind it (#602)', async ({ page }) => {
+    // Linux/Electron reports Shift+/ as key='/', code='Slash'. The help
+    // handler must open the modal AND stop the event so the shortcut
+    // registry's plain `/` library-search shortcut can't also fire and pull
+    // focus to #lib-filter behind the modal (regression for the Copilot
+    // review finding on this PR).
+    await page.evaluate(() => {
+      document.dispatchEvent(new KeyboardEvent('keydown', {
+        key: '/',
+        code: 'Slash',
+        shiftKey: true,
+        bubbles: true,
+        cancelable: true,
+      }));
+    });
+
+    await expect(page.locator('#shortcuts-modal')).toBeVisible();
+    await expect(page.locator('#lib-filter')).not.toBeFocused();
+  });
+
+  test('should trigger ? shortcut on player screen', async ({ page }) => {
+    await openPlayerWithMockSong(page);
+
+    await page.keyboard.press('?');
+
+    await expect(page.locator('#shortcuts-modal')).toBeVisible();
+    await expect(page.locator('#shortcuts-modal')).toContainText('Player');
+  });
+
+  test('should trigger shortcut help on player screen for Linux Electron Shift+Slash event', async ({ page }) => {
+    await openPlayerWithMockSong(page);
+
+    await page.evaluate(() => {
+      document.dispatchEvent(new KeyboardEvent('keydown', {
+        key: '/',
+        code: 'Slash',
+        shiftKey: true,
+        bubbles: true,
+        cancelable: true,
+      }));
+    });
+
+    await expect(page.locator('#shortcuts-modal')).toBeVisible();
+    await expect(page.locator('#shortcuts-modal')).toContainText('Player');
+  });
+
+  test('should trigger shortcut help on player screen when visualization picker is focused', async ({ page }) => {
+    await openPlayerWithMockSong(page);
+    await page.locator('#viz-picker').focus();
+    await expect(page.locator('#viz-picker')).toBeFocused();
+
+    await page.keyboard.press('?');
+
+    await expect(page.locator('#shortcuts-modal')).toBeVisible();
+    await expect(page.locator('#shortcuts-modal')).toContainText('Player');
   });
 
   test('should trigger ? shortcut on settings screen', async ({ page }) => {
