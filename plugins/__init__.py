@@ -38,6 +38,16 @@ PENDING_PLUGINS: dict = {}
 # PENDING_PLUGINS so the background plugin-loader thread and the event-loop
 # request handlers never race on either structure.
 PLUGINS_LOCK = threading.RLock()
+# Monotonic load-generation counter, bumped under PLUGINS_LOCK at the start of
+# every load_plugins() pass. Each pass captures its generation and every
+# registry mutation (the pending seed, _graduate, _mark_failed) re-checks it
+# under the lock before touching LOADED_PLUGINS / PENDING_PLUGINS. This keeps a
+# still-running loader from an EARLIER pass — e.g. a "reload plugins" action,
+# SLOPSMITH_SYNC_STARTUP hot-reload, or test teardown re-invoking load_plugins()
+# while the first pass's background install thread is mid-flight — from
+# repopulating or duplicating entries after a NEWER pass has already cleared the
+# registries. Only the latest pass is allowed to publish.
+_LOAD_GENERATION = 0
 
 # Persistent pip install location (survives container restarts)
 _PIP_TARGET = Path(os.environ.get("CONFIG_DIR", "/config")) / "pip_packages"
@@ -567,9 +577,24 @@ def load_plugins(app: FastAPI, context: dict, progress_cb=None, route_setup_fn=N
     # are usable instead of all-at-once when the slowest install finishes.
     # Tests and dev "reload plugins" re-invoke this; the clear keeps repeated
     # passes from accumulating duplicates while preserving list identity.
+    #
+    # Bump the load generation and capture it locally so every registry
+    # mutation below can verify it's still the latest pass before publishing.
+    # Without this, a background loader from an earlier pass could call
+    # _graduate()/_mark_failed() *after* this pass cleared the registries,
+    # re-inserting a plugin it already graduated (a duplicate) or resurrecting
+    # a stale "installing" entry. See _LOAD_GENERATION.
+    global _LOAD_GENERATION
     with PLUGINS_LOCK:
+        _LOAD_GENERATION += 1
+        my_generation = _LOAD_GENERATION
         LOADED_PLUGINS.clear()
         PENDING_PLUGINS.clear()
+
+    def _is_current_generation() -> bool:
+        """Return True iff this load pass is still the latest one. Callers MUST
+        already hold PLUGINS_LOCK (generation reads/writes are lock-guarded)."""
+        return _LOAD_GENERATION == my_generation
 
     def _loaded_count() -> int:
         with PLUGINS_LOCK:
@@ -578,8 +603,11 @@ def load_plugins(app: FastAPI, context: dict, progress_cb=None, route_setup_fn=N
     def _mark_failed(plugin_id: str, error: str) -> None:
         """Flip a pending plugin's status to "failed" with error text so it
         stays a visible, disabled nav entry. No-op if the plugin already
-        graduated (it can't fail after becoming ready)."""
+        graduated (it can't fail after becoming ready) or if a newer load pass
+        has superseded this one."""
         with PLUGINS_LOCK:
+            if not _is_current_generation():
+                return
             entry = PENDING_PLUGINS.get(plugin_id)
             if entry is not None:
                 entry["status"] = "failed"
@@ -591,10 +619,14 @@ def load_plugins(app: FastAPI, context: dict, progress_cb=None, route_setup_fn=N
         so the published list stays in discovery order even when earlier
         plugins failed (leaving gaps) or a user-copy fallback graduates out of
         sequence after the main loop. Pops the pending entry under the same
-        lock so a reader never sees the plugin in both structures. Returns the
-        new ready count."""
+        lock so a reader never sees the plugin in both structures. No-op (other
+        than returning the current count) if a newer load pass has superseded
+        this one, so a stale background loader can't re-insert into a registry
+        a newer pass already cleared. Returns the new ready count."""
         order = entry.get("_order", 0)
         with PLUGINS_LOCK:
+            if not _is_current_generation():
+                return len(LOADED_PLUGINS)
             pos = sum(1 for e in LOADED_PLUGINS if e.get("_order", 0) < order)
             LOADED_PLUGINS.insert(pos, entry)
             PENDING_PLUGINS.pop(entry["id"], None)
@@ -816,10 +848,25 @@ def load_plugins(app: FastAPI, context: dict, progress_cb=None, route_setup_fn=N
     # kept plugin_id to its discovery index so a user-copy fallback graduating
     # after the main loop can reclaim the bundled plugin's original nav slot.
     _spec_order: dict[str, int] = {}
+    # Cache each kept plugin's base nav entry so graduation can dict()-copy it
+    # instead of re-deriving via _nav_entry() (which re-runs the three-part
+    # _is_bundled() filesystem check and _is_valid_tour_manifest()). Besides
+    # the wasted work, a second computation could disagree with the first if
+    # the filesystem changed mid-load (container overlay, plugin deleted), so
+    # the pending entry and the ready entry are guaranteed to describe the same
+    # plugin. _order is the only mutable field and it's identical here.
+    _spec_entries: dict[str, dict] = {}
     with PLUGINS_LOCK:
+        stale = not _is_current_generation()
         for idx, (plugin_id, plugin_dir, manifest) in enumerate(plugin_load_specs):
             _spec_order[plugin_id] = idx
-            entry = _nav_entry(plugin_id, plugin_dir, manifest, idx)
+            base = _nav_entry(plugin_id, plugin_dir, manifest, idx)
+            _spec_entries[plugin_id] = base
+            # A newer load pass already owns the registries — build the local
+            # caches (used by this pass's bookkeeping) but don't publish.
+            if stale:
+                continue
+            entry = dict(base)
             entry["status"] = "installing"
             entry["error"] = None
             PENDING_PLUGINS[plugin_id] = entry
@@ -1015,7 +1062,10 @@ def load_plugins(app: FastAPI, context: dict, progress_cb=None, route_setup_fn=N
         # plugin is ready. Publish it incrementally — readers (and the SSE
         # `plugin-registered` event that drives the frontend re-fetch) see it
         # the moment it's usable, not when the slowest sibling finishes.
-        loaded_entry = dict(_nav_entry(plugin_id, plugin_dir, manifest, idx))
+        # Reuse the base nav entry computed during discovery rather than
+        # re-deriving it, so the ready entry can't disagree with the pending
+        # one (see _spec_entries).
+        loaded_entry = dict(_spec_entries[plugin_id])
         loaded_entry.update({
             "status": "ready",
             # Normalized list of relpaths under CONFIG_DIR that this

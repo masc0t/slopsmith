@@ -2491,6 +2491,87 @@ def test_pending_then_incremental_publish_observed_during_setup(tmp_path, reset_
     assert plugins.PENDING_PLUGINS == {}
 
 
+def test_stale_load_pass_cannot_republish_after_newer_pass(tmp_path, reset_plugin_state):
+    """A still-running load pass must NOT republish into the registries after a
+    NEWER load_plugins() pass has cleared them (re-entrancy race: a "reload
+    plugins" action, SLOPSMITH_SYNC_STARTUP hot-reload, or test teardown firing
+    while the first pass's background install thread is mid-flight).
+
+    The loader bumps a generation token at the start of every pass; _graduate()
+    and _mark_failed() bail when the generation has advanced. Without the guard,
+    the older pass's _graduate() would re-insert a plugin the newer pass already
+    cleared, leaving a cross-generation / duplicate entry in LOADED_PLUGINS.
+    """
+    import threading
+
+    plugins = reset_plugin_state
+    setup_entered = threading.Event()
+    release_setup = threading.Event()
+    # Stash the events on the module so the file-exec'd plugin setup() can reach
+    # them without globals plumbing. Cleaned up at the end of the test.
+    plugins._TEST_setup_entered = setup_entered
+    plugins._TEST_release_setup = release_setup
+    try:
+        root1 = tmp_path / "gen1"
+        root2 = tmp_path / "gen2"
+        root1.mkdir()
+        root2.mkdir()
+        # Pass 1's plugin blocks inside setup() — past discovery and the PENDING
+        # seed, just before it would graduate — until the test releases it.
+        _make_plugin(
+            root1, "slow",
+            routes_body=(
+                "import plugins\n"
+                "def setup(app, ctx):\n"
+                "    plugins._TEST_setup_entered.set()\n"
+                "    plugins._TEST_release_setup.wait(5)\n"
+            ),
+        )
+        _make_plugin(root2, "fast")  # no-op setup, graduates immediately
+
+        errors = []
+
+        def _pass1():
+            saved = plugins.PLUGINS_DIR
+            plugins.PLUGINS_DIR = root1
+            try:
+                plugins.load_plugins(type("FakeApp", (), {})(), {})
+            except Exception as e:  # pragma: no cover - failure path
+                errors.append(e)
+            finally:
+                plugins.PLUGINS_DIR = saved
+
+        t1 = threading.Thread(target=_pass1)
+        t1.start()
+        # Wait until pass 1 is parked inside slow.setup() (discovery done,
+        # PENDING seeded, about to eventually graduate "slow").
+        assert setup_entered.wait(5), "pass 1 never entered slow.setup()"
+
+        # Pass 2 runs to completion on the main thread: bumps the generation,
+        # clears both registries, graduates "fast".
+        saved = plugins.PLUGINS_DIR
+        plugins.PLUGINS_DIR = root2
+        try:
+            plugins.load_plugins(type("FakeApp", (), {})(), {})
+        finally:
+            plugins.PLUGINS_DIR = saved
+
+        # Release pass 1; it resumes and attempts to graduate "slow" — now stale.
+        release_setup.set()
+        t1.join(5)
+        assert not t1.is_alive(), "pass 1 thread did not finish"
+        assert not errors, f"pass 1 raised: {errors}"
+
+        # Only pass 2's output survives. The stale pass's "slow" must NOT appear
+        # in either registry — its _graduate() was a no-op.
+        assert [p["id"] for p in plugins.LOADED_PLUGINS] == ["fast"]
+        assert "slow" not in plugins.PENDING_PLUGINS
+        assert "slow" not in {p["id"] for p in plugins.LOADED_PLUGINS}
+    finally:
+        delattr(plugins, "_TEST_setup_entered")
+        delattr(plugins, "_TEST_release_setup")
+
+
 def test_failed_plugin_shows_failed_status_and_stays_visible(tmp_path, reset_plugin_state):
     """A plugin whose routes fail to load is NOT added to LOADED_PLUGINS
     (ready-only) but STAYS visible as a disabled "failed" entry in

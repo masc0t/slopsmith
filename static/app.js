@@ -6840,10 +6840,22 @@ async function loadPlugins() {
             navContainer.appendChild(dropdown);
             const ddMenu = dropdown.querySelector('#plugin-dropdown');
 
-            // Close dropdown when clicking outside
-            document.addEventListener('click', (e) => {
-                if (!dropdown.contains(e.target)) ddMenu.classList.add('hidden');
-            });
+            // Close the plugin dropdown when clicking outside it. Bind ONCE:
+            // loadPlugins() re-runs on every plugin status change during
+            // startup (SSE-driven refetches), and each run rebuilds `dropdown`
+            // / `ddMenu`. A per-run addEventListener would leak a new global
+            // click listener on every refetch, each closing over a now-detached
+            // dropdown. The one-time handler instead resolves the LIVE dropdown
+            // from the DOM at click time, so it always targets the current one.
+            if (!window.slopsmith._pluginDropdownOutsideClickBound) {
+                window.slopsmith._pluginDropdownOutsideClickBound = true;
+                document.addEventListener('click', (e) => {
+                    const menu = document.getElementById('plugin-dropdown');
+                    if (!menu) return;
+                    const container = menu.parentElement;
+                    if (container && !container.contains(e.target)) menu.classList.add('hidden');
+                });
+            }
 
             for (const plugin of navPlugins) {
                 const screenId = `plugin-${plugin.id}`;
@@ -6855,6 +6867,11 @@ async function loadPlugins() {
                 // (#421). Entries without a status (legacy / stub) are ready.
                 const status = plugin.status || 'ready';
                 const isReady = status === 'ready';
+                // nav is truthy here (navPlugins is filtered on p.nav), but a
+                // nav object can still omit `label` (e.g. a script-only plugin
+                // that declares an empty nav). Fall back to name/id so a
+                // missing label never renders "undefined" or throws.
+                const label = plugin.nav?.label ?? plugin.name ?? plugin.id;
 
                 const item = document.createElement('a');
                 item.href = '#';
@@ -6866,10 +6883,10 @@ async function loadPlugins() {
 
                 if (isReady) {
                     item.className = 'block px-4 py-2 text-sm text-gray-400 hover:text-white hover:bg-dark-700 transition';
-                    item.textContent = plugin.nav.label;
+                    item.textContent = label;
                     item.onclick = (e) => { e.preventDefault(); ddMenu.classList.add('hidden'); showScreen(screenId); window.slopsmithDemoTrack?.('event/plugin-open/' + plugin.id); };
                     ma.className = 'text-gray-400 hover:text-white pl-4 text-sm';
-                    ma.textContent = plugin.nav.label;
+                    ma.textContent = label;
                     ma.onclick = (e) => { e.preventDefault(); showScreen(screenId); ma.closest('#mobile-menu').classList.add('hidden'); window.slopsmithDemoTrack?.('event/plugin-open/' + plugin.id); };
                 } else {
                     const installing = status === 'installing';
@@ -6883,13 +6900,13 @@ async function loadPlugins() {
                     item.className = cls;
                     item.setAttribute('aria-disabled', 'true');
                     item.title = tip;
-                    item.textContent = plugin.nav.label + suffix;
+                    item.textContent = label + suffix;
                     // Swallow clicks so a disabled entry never navigates.
                     item.onclick = (e) => { e.preventDefault(); };
                     ma.className = 'pl-4 text-sm text-gray-600 cursor-default select-none' + (installing ? ' animate-pulse' : '');
                     ma.setAttribute('aria-disabled', 'true');
                     ma.title = tip;
-                    ma.textContent = plugin.nav.label + suffix;
+                    ma.textContent = label + suffix;
                     ma.onclick = (e) => { e.preventDefault(); };
                 }
             }
@@ -7096,7 +7113,16 @@ function _refreshPluginsSoon() {
     clearTimeout(_pluginRefreshTimer);
     _pluginRefreshTimer = setTimeout(async () => {
         const plugins = await loadPlugins();
-        if (plugins) _populateVizPicker(plugins);
+        if (plugins) {
+            _populateVizPicker(plugins);
+        } else {
+            // loadPlugins() returned null because a refetch was already in
+            // flight, so this status change would otherwise be dropped. Re-arm
+            // the debounce so the newer state is still applied once the
+            // in-flight load finishes. Reuses the 250ms delay (and the
+            // in-flight guard clears quickly), so this can't tight-loop.
+            _refreshPluginsSoon();
+        }
     }, 250);
 }
 
@@ -7144,7 +7170,11 @@ async function _pollPluginStartup() {
     // poll forever.
     if (_pollStartupStarted) return;
     _pollStartupStarted = true;
-    const DEADLINE_MS = 30 * 60 * 1000; // generous: heavy ML installs can be long
+    // Generous headroom over the documented worst case (whisperx → torch et al.
+    // can take 20-30 min): a 30-min ceiling would stop polling right as a
+    // slipping install — slow mirror, pip retry — actually finishes. 60 min
+    // leaves margin so the late graduation still surfaces. (#421)
+    const DEADLINE_MS = 60 * 60 * 1000;
     const start = Date.now();
     let lastLoaded = -1;
     while (Date.now() - start < DEADLINE_MS) {
